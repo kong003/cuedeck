@@ -1,0 +1,630 @@
+import AVFoundation
+import CMixer
+import Foundation
+import QuartzCore
+
+/// Serial queue for releasing audio resources. Voices are released here and
+/// audio outputs are disposed here too, so an output is never destroyed while
+/// a decoder still writes into its mixer.
+enum AudioCleanup {
+    static let queue = DispatchQueue(label: "CueDeck.audio-cleanup", qos: .utility)
+
+    /// Silences a voice now and frees it (and its decoder) in the background.
+    static func release(voice: Int32, decoder: AudioDecoder?, output: AudioOutput?) {
+        guard let output, voice >= 0 else {
+            if let decoder { queue.async { decoder.cancelAndWait() } }
+            return
+        }
+        cm_voice_stop(output.mixer, voice, 0)
+        queue.async {
+            decoder?.cancelAndWait()
+            cm_voice_release(output.mixer, voice)
+        }
+    }
+}
+
+/// One playing instance of a cue: an audio voice in the mixer (all audio
+/// tracks, routed to output channels) plus an AVPlayer for the video, both
+/// started at the same host time and running on the audio device's clock.
+///
+/// Positions are "media time" (see CueTimeline): seconds of source material
+/// since the cue's start point. Output time = media time / speed.
+@MainActor
+final class PlaybackSession: Identifiable {
+    enum State { case preparing, playing, paused, stopping, finished }
+
+    let id = UUID()
+    private(set) var cue: Cue
+    private(set) var state: State = .preparing
+    private(set) var mediaDuration: Double = 0
+    private(set) var speed: Double
+    private(set) var finishedNaturally = false
+    private(set) var isCancelled = false
+    /// Set by the engine once the following cue has been scheduled.
+    var followTriggered = false
+
+    private let output: AudioOutput?
+    private let video: VideoOutput
+    private var player: AVPlayer?
+    private var playerLayer: AVPlayerLayer?
+    private var layerAttached = false
+
+    private var voice: Int32 = -1
+    private var voiceSpeed: Double = 1
+    private var decoder: AudioDecoder?
+    /// The previous stream during a speed crossfade.
+    private var retiringVoice: Int32 = -1
+    private var retiringDecoder: AudioDecoder?
+    private var audioAsset: AVComposition?
+    private var audioTracks: [(track: AVCompositionTrack, channels: Int, layout: Data?)] = []
+
+    private var endObserver: NSObjectProtocol?
+    private var videoEnded = false
+    private var cleanedUp = false
+
+    // Clock anchor: media time `anchorMedia` is heard at host time `anchorHost`.
+    private var anchorHost: UInt64 = 0
+    private var anchorMedia: Double = 0
+    private var anchorPreviousSpeed: Double = 0
+    private var firstStartHost: UInt64 = .max
+    private var pausedMedia: Double = 0
+
+    private var stopStartedAt: CFTimeInterval = 0
+    private var stopFade: Double = 0
+    private var stopStartOpacity: Float = 1
+
+    private var seekGeneration = 0
+    private var seeking = false
+    private var resumeAfterScrub = false
+    private var targetSpeed: Double
+    private var speedTask: Task<Void, Never>?
+
+    init(cue: Cue, output: AudioOutput?, video: VideoOutput) {
+        self.cue = cue
+        self.output = output
+        self.video = video
+        let s = min(max(cue.speed, 0.25), 4)
+        self.speed = s
+        self.targetSpeed = s
+    }
+
+    var isActive: Bool { state == .preparing || state == .playing || state == .paused }
+    var isDone: Bool { state == .finished && cleanedUp }
+
+    // MARK: - Preparation
+
+    /// Loads everything so that start(at:) is instant. Playback begins at
+    /// media time `position`.
+    func prepare(fromMedia position: Double = 0) async throws {
+        let timeline = try await CueTimeline.build(for: cue, audioSpeed: speed)
+        if isCancelled { return }
+        mediaDuration = timeline.mediaDuration
+        let begin = clampMedia(position)
+        pausedMedia = begin
+        anchorMedia = begin
+
+        // Audio: one mixer voice with all tracks.
+        if output != nil, let comp = timeline.audioAsset, !timeline.audioTracks.isEmpty {
+            audioAsset = comp
+            audioTracks = Array(timeline.audioTracks.prefix(Int(CM_MAX_TRACKS)))
+            let made = try await makeVoice(asset: comp, tracks: audioTracks, atMedia: begin,
+                                           speed: speed, prefillSeconds: 1.0, ramp: 0)
+            voice = made.voice
+            decoder = made.decoder
+            voiceSpeed = speed
+            if isCancelled { return }
+        }
+
+        // Video: muted AVPlayer slaved to the audio device clock.
+        if let videoAsset = timeline.videoAsset {
+            let item = AVPlayerItem(asset: videoAsset)
+            let p = AVPlayer(playerItem: item)
+            p.automaticallyWaitsToMinimizeStalling = false
+            p.actionAtItemEnd = .pause
+            p.isMuted = true
+            if let clock = output?.clock { p.sourceClock = clock }
+            player = p
+
+            let deadline = Date().addingTimeInterval(20)
+            while item.status == .unknown && Date() < deadline && !isCancelled {
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            if isCancelled { return }
+            if item.status == .failed {
+                throw item.error ?? MediaError.build("The video of \(cue.name) could not be loaded.")
+            }
+            if begin > 0 {
+                _ = await p.seek(to: cmTime(begin), toleranceBefore: .zero, toleranceAfter: .zero)
+            }
+            if item.status == .readyToPlay {
+                _ = await p.preroll(atRate: Float(speed))
+            }
+            endObserver = NotificationCenter.default.addObserver(
+                forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
+                guard let session = self else { return }
+                Task { @MainActor in session.videoEnded = true }
+            }
+            // The layer goes on the output (invisible) now, so its first frame
+            // is ready the moment playback starts. This opens the output window
+            // a fraction of a second before the cue starts.
+            let layer = AVPlayerLayer(player: p)
+            layer.videoGravity = .resizeAspect
+            layer.opacity = 0
+            playerLayer = layer
+            video.attach(layer)
+            layerAttached = true
+        }
+    }
+
+    /// Creates a mixer voice for an audio timeline stretched to `speed`,
+    /// positioned at media time `media`, and starts decoding there.
+    private func makeVoice(asset: AVComposition,
+                           tracks: [(track: AVCompositionTrack, channels: Int, layout: Data?)],
+                           atMedia media: Double, speed s: Double,
+                           prefillSeconds: Double, ramp: Double) async throws -> (voice: Int32, decoder: AudioDecoder) {
+        guard let out = output else { throw MediaError.build("No audio output.") }
+        let channelCounts = tracks.map { UInt32($0.channels) }
+        let ringFrames = UInt32(out.sampleRate * 4)
+        let v = channelCounts.withUnsafeBufferPointer { buf -> Int32 in
+            guard let base = buf.baseAddress else { return -1 }
+            return cm_voice_create(out.mixer, UInt32(buf.count), base, ringFrames)
+        }
+        guard v >= 0 else {
+            throw MediaError.build("Too many cues are playing at the same time.")
+        }
+        let rate = out.sampleRate
+        applyRoutes(to: v, trackCount: tracks.count)
+        cm_voice_set_gain(out.mixer, v, cue.linearGain)
+        let fadeOut = cue.endAction == .loop ? 0 : cue.fadeOut
+        cm_voice_set_envelope(out.mixer, v, Int64(mediaDuration / s * rate),
+                              Int64(cue.fadeIn * rate), Int64(fadeOut * rate))
+        let outputStart = media / s
+        cm_voice_set_position(out.mixer, v, Int64(outputStart * rate))
+        if ramp > 0 { cm_voice_set_start_ramp(out.mixer, v, Int64(ramp * rate)) }
+        do {
+            let dec = try AudioDecoder(asset: asset, tracks: tracks, sampleRate: rate,
+                                       mixer: out.mixer, voice: v, startTime: outputStart)
+            dec.start()
+            _ = await dec.waitForPrefill(seconds: prefillSeconds, sampleRate: rate)
+            return (v, dec)
+        } catch {
+            AudioCleanup.release(voice: v, decoder: nil, output: out)
+            throw error
+        }
+    }
+
+    private func cmTime(_ seconds: Double) -> CMTime {
+        CMTime(seconds: seconds, preferredTimescale: 48000)
+    }
+
+    // MARK: - Transport
+
+    /// Starts audio and video exactly at `host` (mach_absolute_time ticks).
+    func start(at host: UInt64) {
+        guard state == .preparing, !isCancelled else { return }
+        firstStartHost = host
+        setAnchor(host: host, media: pausedMedia, previousSpeed: 0)
+        if voice >= 0, let out = output { cm_voice_start(out.mixer, voice, host) }
+        player?.setRate(Float(speed), time: cmTime(pausedMedia), atHostTime: HostClock.cmTime(host))
+        state = .playing
+        startSpeedTaskIfNeeded()
+    }
+
+    func pause() {
+        guard state == .playing else { return }
+        releaseRetiring()
+        pausedMedia = mediaTime
+        if voice >= 0, let out = output {
+            cm_voice_pause(out.mixer, voice)
+            pausedMedia = Double(cm_voice_position(out.mixer, voice)) / out.sampleRate * voiceSpeed
+        }
+        player?.rate = 0
+        state = .paused
+    }
+
+    func resume() {
+        guard state == .paused, !seeking else { return }
+        let host = HostClock.now() + HostClock.ticks(seconds: 0.08)
+        var position = pausedMedia
+        if voice >= 0, let out = output {
+            position = Double(cm_voice_position(out.mixer, voice)) / out.sampleRate * voiceSpeed
+            cm_voice_start(out.mixer, voice, host)
+        }
+        player?.setRate(Float(speed), time: cmTime(position), atHostTime: HostClock.cmTime(host))
+        setAnchor(host: host, media: position, previousSpeed: 0)
+        state = .playing
+        startSpeedTaskIfNeeded()
+    }
+
+    /// Fades out over `fade` seconds and finishes. 0 stops immediately.
+    func stop(fade: Double) {
+        switch state {
+        case .preparing:
+            isCancelled = true
+            return
+        case .finished:
+            return
+        case .stopping:
+            if fade <= 0 { finish() }
+            return
+        case .paused:
+            finish()
+            return
+        case .playing:
+            break
+        }
+        if fade <= 0 {
+            finish()
+            return
+        }
+        if voice >= 0, let out = output {
+            cm_voice_stop(out.mixer, voice, Int64(fade * out.sampleRate))
+        }
+        if retiringVoice >= 0, let out = output {
+            cm_voice_stop(out.mixer, retiringVoice, Int64(fade * out.sampleRate))
+        }
+        stopFade = fade
+        stopStartedAt = CACurrentMediaTime()
+        stopStartOpacity = playerLayer?.opacity ?? 1
+        state = .stopping
+    }
+
+    private func setAnchor(host: UInt64, media: Double, previousSpeed: Double) {
+        anchorHost = host
+        anchorMedia = media
+        anchorPreviousSpeed = previousSpeed
+    }
+
+    /// Frees the stream that is being crossfaded away (if any).
+    private func releaseRetiring(ifVoice only: Int32? = nil) {
+        guard retiringVoice >= 0 else { return }
+        if let only, only != retiringVoice { return }
+        AudioCleanup.release(voice: retiringVoice, decoder: retiringDecoder, output: output)
+        retiringVoice = -1
+        retiringDecoder = nil
+    }
+
+    // MARK: - Seeking
+
+    /// Live scrubbing while dragging: pauses and shows the frame on the output.
+    func scrub(toMedia target: Double) {
+        guard state == .playing || state == .paused else { return }
+        if state == .playing {
+            pause()
+            resumeAfterScrub = true
+        }
+        let m = clampMedia(target)
+        pausedMedia = m
+        let tol = CMTime(seconds: 0.1, preferredTimescale: 600)
+        player?.seek(to: cmTime(m), toleranceBefore: tol, toleranceAfter: tol)
+    }
+
+    /// Jumps to media time `target`. Keeps playing if the cue was playing (or
+    /// was playing before scrubbing), otherwise stays paused there.
+    func seek(toMedia target: Double) async {
+        guard state == .playing || state == .paused else { return }
+        let shouldResume = state == .playing || resumeAfterScrub
+        resumeAfterScrub = false
+        if state == .playing { pause() }
+
+        seekGeneration += 1
+        let generation = seekGeneration
+        seeking = true
+        let m = clampMedia(target)
+        pausedMedia = m
+        videoEnded = false
+
+        // Audio: replace the voice with one that starts at m.
+        releaseRetiring()
+        if output != nil, let comp = audioAsset {
+            AudioCleanup.release(voice: voice, decoder: decoder, output: output)
+            voice = -1
+            decoder = nil
+            do {
+                let made = try await makeVoice(asset: comp, tracks: audioTracks, atMedia: m,
+                                               speed: voiceSpeed, prefillSeconds: 0.3, ramp: 0.01)
+                if generation != seekGeneration || state == .finished {
+                    AudioCleanup.release(voice: made.voice, decoder: made.decoder, output: output)
+                    return
+                }
+                voice = made.voice
+                decoder = made.decoder
+            } catch {
+                if generation == seekGeneration { seeking = false }
+                return
+            }
+        }
+
+        if let p = player {
+            _ = await p.seek(to: cmTime(m), toleranceBefore: .zero, toleranceAfter: .zero)
+            if generation != seekGeneration || state == .finished { return }
+        }
+        seeking = false
+        if shouldResume && state == .paused { resume() }
+    }
+
+    private func clampMedia(_ m: Double) -> Double {
+        min(max(0, m), max(0, mediaDuration - 0.05))
+    }
+
+    // MARK: - Live speed
+
+    /// Changes the playback speed while playing (or paused). Audio crossfades
+    /// to a re-stretched stream at an exact host time; video changes rate at
+    /// that same moment, so picture and sound stay locked.
+    func setSpeed(_ newSpeed: Double) {
+        targetSpeed = min(max(newSpeed, 0.25), 4)
+        startSpeedTaskIfNeeded()
+    }
+
+    private func startSpeedTaskIfNeeded() {
+        guard speedTask == nil, targetSpeed != speed, state == .playing || state == .paused else { return }
+        speedTask = Task { [weak self] in
+            await self?.runSpeedChanges()
+        }
+    }
+
+    private func runSpeedChanges() async {
+        defer { speedTask = nil }
+        var attempts = 0
+        while targetSpeed != speed && attempts < 20 {
+            attempts += 1
+            switch state {
+            case .playing:
+                if seeking {
+                    try? await Task.sleep(nanoseconds: 30_000_000)
+                } else {
+                    await switchSpeedWhilePlaying(to: targetSpeed)
+                }
+            case .paused:
+                await switchSpeedWhilePaused(to: targetSpeed)
+            default:
+                return
+            }
+        }
+    }
+
+    private func switchSpeedWhilePlaying(to s2: Double) async {
+        let s1 = speed
+        let generation = seekGeneration
+
+        guard output != nil, audioAsset != nil else {
+            // No audio voice: only the video (or the wall clock) changes rate.
+            let host = HostClock.now() + HostClock.ticks(seconds: 0.03)
+            let m = mediaTime + 0.03 * s1
+            player?.setRate(Float(s2), time: cmTime(m), atHostTime: HostClock.cmTime(host))
+            setAnchor(host: host, media: m, previousSpeed: s1)
+            speed = s2
+            return
+        }
+
+        guard let timeline = try? await CueTimeline.build(for: cue, audioSpeed: s2, includeVideo: false),
+              let comp = timeline.audioAsset, state == .playing, generation == seekGeneration else {
+            if state == .playing && generation == seekGeneration { targetSpeed = speed }
+            return
+        }
+        let tracks = Array(timeline.audioTracks.prefix(Int(CM_MAX_TRACKS)))
+
+        // Start the new stream a little ahead, then switch exactly when the
+        // current stream reaches that point.
+        let switchMedia = clampMedia(mediaTime + 0.35 * s1)
+        let made: (voice: Int32, decoder: AudioDecoder)
+        do {
+            made = try await makeVoice(asset: comp, tracks: tracks, atMedia: switchMedia,
+                                       speed: s2, prefillSeconds: 0.25, ramp: 0.03)
+        } catch {
+            targetSpeed = speed
+            return
+        }
+        guard state == .playing, generation == seekGeneration, let out = output else {
+            AudioCleanup.release(voice: made.voice, decoder: made.decoder, output: output)
+            return
+        }
+
+        let secondsUntilSwitch = max(0, (switchMedia - mediaTime) / s1)
+        let host = HostClock.now() + HostClock.ticks(seconds: secondsUntilSwitch)
+        releaseRetiring()
+        let oldVoice = voice
+        retiringVoice = voice
+        retiringDecoder = decoder
+
+        cm_voice_start(out.mixer, made.voice, host)
+        if oldVoice >= 0 { cm_voice_stop_at(out.mixer, oldVoice, host, Int64(0.03 * out.sampleRate)) }
+        player?.setRate(Float(s2), time: cmTime(switchMedia), atHostTime: HostClock.cmTime(host))
+
+        voice = made.voice
+        decoder = made.decoder
+        voiceSpeed = s2
+        audioAsset = comp
+        audioTracks = tracks
+        setAnchor(host: host, media: switchMedia, previousSpeed: s1)
+        speed = s2
+
+        // Free the old stream once its crossfade is over.
+        let delay = UInt64((secondsUntilSwitch + 0.3) * 1_000_000_000)
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: delay)
+            self?.releaseRetiring(ifVoice: oldVoice)
+        }
+    }
+
+    private func switchSpeedWhilePaused(to s2: Double) async {
+        let generation = seekGeneration
+        if output != nil, audioAsset != nil {
+            guard let timeline = try? await CueTimeline.build(for: cue, audioSpeed: s2, includeVideo: false),
+                  let comp = timeline.audioAsset, state == .paused, generation == seekGeneration else {
+                if state == .paused && generation == seekGeneration { targetSpeed = speed }
+                return
+            }
+            audioAsset = comp
+            audioTracks = Array(timeline.audioTracks.prefix(Int(CM_MAX_TRACKS)))
+            voiceSpeed = s2
+            speed = s2
+            await seek(toMedia: pausedMedia)   // rebuilds the voice at the new speed, stays paused
+        } else {
+            speed = s2
+        }
+    }
+
+    // MARK: - Live changes
+
+    /// Applies volume, routing and speed changes while playing.
+    func update(cue newCue: Cue) {
+        guard newCue.id == cue.id else { return }
+        let routesChanged = newCue.routes != cue.routes
+        cue.volumeDB = newCue.volumeDB
+        cue.routes = newCue.routes
+        cue.stopFade = newCue.stopFade
+        cue.name = newCue.name
+        cue.audioTracks = newCue.audioTracks
+        cue.markers = newCue.markers
+        cue.speed = newCue.speed
+        if voice >= 0, let out = output {
+            cm_voice_set_gain(out.mixer, voice, cue.linearGain)
+            if routesChanged { applyRoutes(to: voice, trackCount: audioTracks.count) }
+        }
+        if min(max(newCue.speed, 0.25), 4) != targetSpeed { setSpeed(newCue.speed) }
+    }
+
+    private func applyRoutes(to v: Int32, trackCount: Int) {
+        guard v >= 0, let out = output else { return }
+        for t in 0..<trackCount {
+            let chans = t < cue.routes.count ? cue.routes[t] : []
+            let n = t < cue.audioTracks.count ? cue.audioTracks[t].channels : chans.count
+            for c in 0..<min(n, Int(CM_MAX_TRACK_CH)) {
+                let o = c < chans.count ? chans[c] : -1
+                cm_voice_set_route(out.mixer, v, UInt32(t), UInt32(c), Int32(o))
+            }
+        }
+    }
+
+    // MARK: - Clock
+
+    /// Position in media time (seconds of source material since the start point).
+    var mediaTime: Double {
+        switch state {
+        case .preparing, .paused: return pausedMedia
+        default: break
+        }
+        if seeking { return pausedMedia }
+        let now = HostClock.now()
+        if now < anchorHost {
+            // Before a scheduled start or speed switch: extrapolate backwards.
+            let ahead = Double(anchorHost - now) / HostClock.ticksPerSecond
+            return max(0, anchorMedia - ahead * anchorPreviousSpeed)
+        }
+        if voice >= 0, let out = output {
+            return Double(cm_voice_position(out.mixer, voice)) / out.sampleRate * voiceSpeed
+        }
+        if let p = player { return max(0, p.currentTime().seconds) }
+        return anchorMedia + Double(now - anchorHost) / HostClock.ticksPerSecond * speed
+    }
+
+    /// Output seconds left until the cue ends.
+    var remaining: Double { max(0, (mediaDuration - mediaTime) / speed) }
+    /// Total output length at the current speed.
+    var duration: Double { mediaDuration / speed }
+    /// Output seconds since the start point at the current speed.
+    var elapsed: Double { mediaTime / speed }
+
+    /// Position in the source file (seconds), for the timeline display.
+    var fileTime: Double { cue.fileTime(forMedia: mediaTime) }
+
+    /// File time of the video frame on screen right now (falls back to the
+    /// audio position for cues without video). Used for exact markers.
+    var displayedFileTime: Double {
+        if let p = player, state != .preparing, !seeking {
+            let t = p.currentTime().seconds
+            if t.isFinite { return cue.fileTime(forMedia: max(0, t)) }
+        }
+        return fileTime
+    }
+
+    /// Which loop pass is playing (0 for cues that don't loop).
+    var loopPass: Int {
+        let seg = cue.segmentDuration
+        guard cue.endAction == .loop, seg > 0 else { return 0 }
+        return Int(mediaTime / seg)
+    }
+
+    /// Host time at which the cue will end if nothing changes.
+    var endHostTime: UInt64 { HostClock.now() + HostClock.ticks(seconds: remaining) }
+
+    // MARK: - Per-frame update (called by the engine at 60 Hz)
+
+    func tick() {
+        guard state == .playing || state == .stopping else { return }
+
+        let started = HostClock.now() >= firstStartHost
+        let elapsedOut = elapsed
+        let remainingOut = remaining
+        var stopProgress: Double = 0
+        if state == .stopping {
+            stopProgress = stopFade > 0 ? (CACurrentMediaTime() - stopStartedAt) / stopFade : 1
+        }
+
+        if let layer = playerLayer {
+            var o = 1.0
+            if cue.fadeIn > 0 { o = min(o, elapsedOut / cue.fadeIn) }
+            if cue.fadeOut > 0 && cue.endAction != .loop { o = min(o, remainingOut / cue.fadeOut) }
+            if state == .stopping { o = min(o, Double(stopStartOpacity) * (1 - stopProgress)) }
+            if !started { o = 0 }
+            let opacity = Float(min(1, max(0, o)))
+            if layer.opacity != opacity {
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                layer.opacity = opacity
+                CATransaction.commit()
+            }
+        }
+        if seeking || speedTask != nil && HostClock.now() < anchorHost { return }
+
+        let audioDone: Bool = {
+            guard voice >= 0, let out = output else { return true }
+            return cm_voice_state(out.mixer, voice) == CM_FINISHED
+        }()
+
+        if state == .stopping {
+            if (stopProgress >= 1 && audioDone) || stopProgress >= 1.5 { finish() }
+            return
+        }
+
+        let mediaDone: Bool
+        if player != nil {
+            mediaDone = videoEnded || mediaTime >= mediaDuration - 0.02 * speed
+        } else if voice >= 0 {
+            mediaDone = true
+        } else {
+            mediaDone = mediaTime >= mediaDuration
+        }
+        if audioDone && mediaDone {
+            finishedNaturally = true
+            finish()
+        }
+    }
+
+    // MARK: - Teardown
+
+    /// Stops everything now and releases all resources.
+    func finish() {
+        state = .finished
+        guard !cleanedUp else { return }
+        cleanedUp = true
+        seekGeneration += 1
+        speedTask?.cancel()
+
+        if let obs = endObserver { NotificationCenter.default.removeObserver(obs) }
+        endObserver = nil
+        player?.rate = 0
+        if let layer = playerLayer, layerAttached { video.detach(layer) }
+        layerAttached = false
+        playerLayer = nil
+        player?.replaceCurrentItem(with: nil)
+        player = nil
+
+        AudioCleanup.release(voice: voice, decoder: decoder, output: output)
+        decoder = nil
+        voice = -1
+        releaseRetiring()
+    }
+}
