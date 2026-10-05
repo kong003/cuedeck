@@ -4,3 +4,4 @@ build/
 *.xcodeproj/
 .DS_Store
 Tests/cmixer/test_mixer
+Tests/cmixer/test_mixer.dSYM/
