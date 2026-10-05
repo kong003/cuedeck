@@ -121,15 +121,45 @@ enum MediaInspector {
             cue.frameRate = 0
         }
 
+        let handlerNames = MovieHeader.handlerNames(of: cue.url)
         var infos: [AudioTrackInfo] = []
         for (i, t) in audio.enumerated() {
-            var label = "Track \(i + 1) · \(t.channels) ch"
+            var label = "Stream \(i + 1) · \(t.channels) ch"
             if let lang = try? await t.track.load(.languageCode), !lang.isEmpty, lang != "und" {
                 label += " · \(lang)"
             }
-            infos.append(AudioTrackInfo(index: i, channels: t.channels, label: label))
+            var info = AudioTrackInfo(index: i, channels: t.channels, label: label)
+            info.fileName = await trackName(t.track, handlerNames: handlerNames)
+            infos.append(info)
         }
         cue.audioTracks = infos
+    }
+
+    /// The name a track carries in the file, "" if none: the QuickTime track
+    /// name (ffmpeg writes it from a stream title), a title tag, or the
+    /// handler name many MP4 encoders use for it ("German").
+    static func trackName(_ track: AVAssetTrack, handlerNames: [CMPersistentTrackID: String]) async -> String {
+        if let items = try? await track.load(.metadata), !items.isEmpty {
+            for id in [AVMetadataIdentifier.quickTimeUserDataTrackName, .quickTimeMetadataTitle,
+                       .commonIdentifierTitle, .iTunesMetadataSongName] {
+                for item in AVMetadataItem.metadataItems(from: items, filteredByIdentifier: id) {
+                    if let v = try? await item.load(.stringValue) {
+                        let t = v.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !t.isEmpty { return t }
+                    }
+                }
+            }
+        }
+        return handlerNames[track.trackID] ?? ""
+    }
+
+    /// Stream names from the file, in audio track order.
+    static func trackNames(of url: URL) async -> [String]? {
+        guard let tracks = try? await AVURLAsset(url: url).loadTracks(withMediaType: .audio) else { return nil }
+        let handlerNames = MovieHeader.handlerNames(of: url)
+        var names: [String] = []
+        for t in tracks { names.append(await trackName(t, handlerNames: handlerNames)) }
+        return names
     }
 }
 
@@ -226,5 +256,112 @@ struct CueTimeline {
 
         return CueTimeline(videoAsset: videoAsset, audioAsset: audioComp, audioTracks: audioTracks,
                            mediaDuration: total.seconds, audioSpeed: speed, repetitions: reps)
+    }
+}
+
+/// Minimal MP4/MOV box reader for what AVFoundation doesn't expose: the
+/// handler name of each track (moov/trak/mdia/hdlr), keyed by track ID.
+/// Generic encoder names ("SoundHandler", "… Media Handler") are skipped.
+enum MovieHeader {
+    static func handlerNames(of url: URL) -> [CMPersistentTrackID: String] {
+        guard let file = try? FileHandle(forReadingFrom: url) else { return [:] }
+        defer { try? file.close() }
+        guard let moov = findTopLevelBox("moov", in: file) else { return [:] }
+        var result: [CMPersistentTrackID: String] = [:]
+        for trak in boxes(in: moov) where trak.type == "trak" {
+            var trackID: CMPersistentTrackID?
+            var name: String?
+            for b in boxes(in: trak.body) {
+                if b.type == "tkhd" { trackID = tkhdTrackID(b.body) }
+                if b.type == "mdia" {
+                    for m in boxes(in: b.body) where m.type == "hdlr" { name = hdlrName(m.body) }
+                }
+            }
+            if let trackID, let name, isMeaningful(name) { result[trackID] = name }
+        }
+        return result
+    }
+
+    private static func isMeaningful(_ name: String) -> Bool {
+        let n = name.lowercased()
+        let generic = ["soundhandler", "core media audio", "sound handler", "audio handler", "alias data handler"]
+        return !n.isEmpty && !n.contains("media handler") && !n.hasSuffix(" handler") && !generic.contains(n)
+    }
+
+    private static func readUInt32(_ d: Data, _ at: Int) -> UInt32? {
+        guard at + 4 <= d.count else { return nil }
+        return d[d.startIndex + at ..< d.startIndex + at + 4].reduce(0) { $0 << 8 | UInt32($1) }
+    }
+
+    private static func readUInt64(_ d: Data, _ at: Int) -> UInt64? {
+        guard at + 8 <= d.count else { return nil }
+        return d[d.startIndex + at ..< d.startIndex + at + 8].reduce(0) { $0 << 8 | UInt64($1) }
+    }
+
+    /// Reads the top-level boxes' headers until `type` is found, returns its body.
+    private static func findTopLevelBox(_ type: String, in file: FileHandle) -> Data? {
+        guard let end = try? file.seekToEnd() else { return nil }
+        var offset: UInt64 = 0
+        while offset + 8 <= end {
+            try? file.seek(toOffset: offset)
+            guard let head = try? file.read(upToCount: 16), head.count >= 8,
+                  let size32 = readUInt32(head, 0) else { return nil }
+            let boxType = String(decoding: head[head.startIndex + 4 ..< head.startIndex + 8], as: UTF8.self)
+            var size = UInt64(size32), headerSize: UInt64 = 8
+            if size32 == 1 {
+                guard let large = readUInt64(head, 8) else { return nil }
+                size = large; headerSize = 16
+            } else if size32 == 0 {
+                size = end - offset
+            }
+            guard size >= headerSize else { return nil }
+            if boxType == type {
+                // The movie header is small; refuse anything absurd.
+                guard size - headerSize < 256 << 20 else { return nil }
+                try? file.seek(toOffset: offset + headerSize)
+                return try? file.read(upToCount: Int(size - headerSize))
+            }
+            offset += size
+        }
+        return nil
+    }
+
+    private static func boxes(in data: Data) -> [(type: String, body: Data)] {
+        var result: [(String, Data)] = []
+        var at = 0
+        while at + 8 <= data.count, let size32 = readUInt32(data, at) {
+            let type = String(decoding: data[data.startIndex + at + 4 ..< data.startIndex + at + 8], as: UTF8.self)
+            var size = Int(size32), header = 8
+            if size32 == 1 {
+                guard let large = readUInt64(data, at + 8), large <= UInt64(Int.max) else { break }
+                size = Int(large); header = 16
+            } else if size32 == 0 {
+                size = data.count - at
+            }
+            guard size >= header, at + size <= data.count else { break }
+            result.append((type, data[data.startIndex + at + header ..< data.startIndex + at + size]))
+            at += size
+        }
+        return result
+    }
+
+    private static func tkhdTrackID(_ body: Data) -> CMPersistentTrackID? {
+        guard let first = body.first else { return nil }
+        let at = first == 1 ? 4 + 16 : 4 + 8   // version 1 has 64-bit times
+        return readUInt32(body, at).map { CMPersistentTrackID(bitPattern: $0) }
+    }
+
+    /// hdlr: version/flags, pre_defined, handler type, 12 reserved bytes, name.
+    private static func hdlrName(_ body: Data) -> String? {
+        guard body.count > 24 else { return nil }
+        var bytes = [UInt8](body[body.startIndex + 24 ..< body.endIndex])
+        // QuickTime files store a length-prefixed (Pascal) string, MP4 a C string.
+        // A name never starts with a control character, so such a byte is a length.
+        if let len = bytes.first, len > 0, len < 0x20, Int(len) < bytes.count {
+            bytes = Array(bytes[1...Int(len)])
+        }
+        if let zero = bytes.firstIndex(of: 0) { bytes = Array(bytes[..<zero]) }
+        let name = String(decoding: bytes, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? nil : name
     }
 }

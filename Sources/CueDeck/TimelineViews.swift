@@ -51,7 +51,7 @@ final class ThumbnailStore: ObservableObject {
             let gen = AVAssetImageGenerator(asset: AVURLAsset(url: url))
             gen.appliesPreferredTrackTransform = true
             gen.maximumSize = CGSize(width: 640, height: 360)
-            // Exact frame, so the preview matches markers and typed times.
+            // Exact frame, so the preview matches typed times.
             gen.requestedTimeToleranceBefore = .zero
             gen.requestedTimeToleranceAfter = .zero
             if let result = try? await gen.image(at: CMTime(seconds: seconds, preferredTimescale: 600)),
@@ -62,83 +62,55 @@ final class ThumbnailStore: ObservableObject {
     }
 }
 
-// MARK: - Timeline section of the inspector
+// MARK: - Video lane of the bottom panel
 
-struct CueTimelineSection: View {
+/// Video row of the bottom panel: the frame at the playhead on the left and
+/// a thumbnail strip to click or drag, aligned with the waveforms below.
+struct VideoLane: View {
     @EnvironmentObject var engine: PlaybackEngine
-    @Binding var cue: Cue
+    let cue: Cue
     @StateObject private var thumbs = ThumbnailStore()
 
     private var playhead: Double { engine.playhead(for: cue.id) ?? cue.segmentStart }
     private var isPlaying: Bool { engine.activeCueIDs.contains(cue.id) }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            if cue.hasVideo && !isPlaying, let img = thumbs.preview {
-                Image(decorative: img, scale: 1)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(maxWidth: .infinity, maxHeight: 150)
-                    .background(Color.black)
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
+        HStack(spacing: 8) {
+            ZStack {
+                Color.black
+                if let img = thumbs.preview {
+                    Image(decorative: img, scale: 1).resizable().aspectRatio(contentMode: .fit)
+                } else {
+                    Image(systemName: "film").foregroundStyle(.secondary)
+                }
             }
+            .frame(width: 80, height: 45)
+            .clipShape(RoundedRectangle(cornerRadius: 4))
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Video").font(.caption.weight(.semibold))
+                Text(cue.audioOnly ? "Audio only, not shown" : cue.videoSize)
+                    .font(.system(size: 9)).foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            .frame(width: 102, alignment: .leading)
 
             ScrubBar(cue: cue, playhead: playhead, thumbnails: thumbs.thumbnails) { seconds, final in
                 if final { engine.seek(cue.id, toFile: seconds) } else { engine.scrub(cue.id, toFile: seconds) }
             }
-            .frame(height: cue.hasVideo ? 54 : 30)
-
-            FlowLayout(spacing: 6, lineSpacing: 6) {
-                TimecodeField(seconds: playhead) { engine.seek(cue.id, toFile: $0) }
-                    .frame(width: 112)
-                HStack(spacing: 4) {
-                    Button { engine.stepFrame(cue.id, by: -1) } label: { Image(systemName: "chevron.left") }
-                        .help("One frame back (←)")
-                    Button { engine.stepFrame(cue.id, by: 1) } label: { Image(systemName: "chevron.right") }
-                        .help("One frame forward (→)")
-                }
-                HStack(spacing: 4) {
-                    Button { engine.nudge(cue.id, by: -10) } label: { Image(systemName: "gobackward.10") }
-                        .help("Back 10 seconds")
-                    Button { engine.nudge(cue.id, by: 10) } label: { Image(systemName: "goforward.10") }
-                        .help("Forward 10 seconds")
-                    Button { engine.seek(cue.id, toFile: cue.segmentStart) } label: { Image(systemName: "backward.end.fill") }
-                        .help("Back to the start point")
-                }
-                Button { engine.addMarker(cue.id) } label: { Label("Marker", systemImage: "bookmark") }
-                    .help("Add a marker at the frame on screen (M)")
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-
-            Text(isPlaying
-                 ? "Click or drag the bar to jump. Type a time and press Return."
-                 : (engine.pendingStarts[cue.id] != nil
-                    ? "GO starts at \(formatTimecode(playhead))."
-                    : "Click the bar or type a time to choose where GO starts."))
-                .font(.caption).foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            if !cue.markers.isEmpty {
-                MarkerList(cue: $cue)
-            }
         }
-        .padding(.vertical, 4)
+        .frame(height: 48)
         .task(id: "\(cue.url.path)|\(cue.duration)") {
-            if cue.hasVideo {
-                thumbs.load(url: cue.url, start: 0, end: cue.duration, count: 12)
-            }
+            thumbs.load(url: cue.url, start: 0, end: cue.duration, count: 16)
+            thumbs.requestPreview(url: cue.url, at: cue.seekTarget(playhead))
         }
         .onChange(of: playhead) { p in
-            if cue.hasVideo && !isPlaying { thumbs.requestPreview(url: cue.url, at: cue.seekTarget(p)) }
-        }
-        .onAppear {
-            if cue.hasVideo { thumbs.requestPreview(url: cue.url, at: cue.seekTarget(playhead)) }
+            if !isPlaying { thumbs.requestPreview(url: cue.url, at: cue.seekTarget(p)) }
         }
     }
 }
 
-/// Horizontal bar over the whole file. Shows thumbnails, markers and the
+/// Horizontal bar over the whole file. Shows thumbnails and the
 /// playhead; the parts outside the start and end points are dimmed. Click
 /// or drag to move the playhead.
 struct ScrubBar: View {
@@ -181,13 +153,6 @@ struct ScrubBar: View {
                 Rectangle().fill(Color.green).frame(width: 2, height: h).offset(x: sx - 1)
                 Rectangle().fill(Color.red.opacity(0.8)).frame(width: 2, height: h).offset(x: ex - 1)
 
-                ForEach(cue.markers) { m in
-                    Rectangle().fill(Color.yellow)
-                        .frame(width: 2, height: h)
-                        .offset(x: tl.x(m.time) - 1)
-                        .help(m.name)
-                }
-
                 Rectangle().fill(Color.red)
                     .frame(width: 2, height: h + 6)
                     .offset(x: min(max(tl.x(playhead), 0), geo.size.width) - 1, y: -3)
@@ -226,6 +191,7 @@ struct TimecodeField: View {
                 if let v = parseTimecode(text) {
                     invalid = false
                     onCommit(v)
+                    focused = false   // back to the show keys (Space = GO)
                 } else {
                     invalid = true
                 }
@@ -238,45 +204,5 @@ struct TimecodeField: View {
                 if !f { invalid = false; text = formatTimecode(seconds) }
             }
             .help("Type a time (e.g. 1:23.5 or 83.5) and press Return")
-    }
-}
-
-struct MarkerList: View {
-    @EnvironmentObject var engine: PlaybackEngine
-    @Binding var cue: Cue
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            ForEach($cue.markers) { $marker in
-                HStack(spacing: 6) {
-                    Button {
-                        engine.seek(cue.id, toFile: marker.time)
-                    } label: {
-                        Image(systemName: "play.circle.fill")
-                    }
-                    .buttonStyle(.borderless)
-                    .help("Jump to this marker")
-                    TimecodeField(seconds: marker.time) { t in
-                        marker.time = cue.frameStart(t)
-                    }
-                    .frame(width: 104)
-                    .help("Type an exact time for this marker")
-                    TextField("Name", text: $marker.name)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(minWidth: 60)
-                    Button {
-                        marker.time = cue.frameStart(engine.livePlayhead(cue.id))
-                    } label: { Image(systemName: "scope") }
-                    .buttonStyle(.borderless)
-                    .help("Move this marker to the frame on screen")
-                    Button {
-                        let id = marker.id
-                        cue.markers.removeAll { $0.id == id }
-                    } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }
-                    .buttonStyle(.borderless)
-                    .help("Delete marker")
-                }
-            }
-        }
     }
 }

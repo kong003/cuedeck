@@ -39,18 +39,17 @@ open build/CueDeck.app
      previous cue (seamlessly), or together with the previous cue. GO skips
      cues that start by themselves.
    - **Audio routing**: each audio stream has an output dropdown, right in the
-     cue list and in the inspector (stream 1 → 1–2, stream 2 → 3–4, …). Open
-     "channels" in the inspector to route single channels. Changes apply
+     cue list (Stream 1 → 1–2, Stream 2 → 3–4, …). Changes apply
      instantly, also while playing. The routing new cues get is set in
      CueDeck › Settings (⌘,): choose the first output for each stream.
-   - **Names**: rename audio streams in the inspector; name the outputs
+   - **Names**: streams show the name stored in the file; name the outputs
      themselves with *Output names…* in the bottom bar.
-4. **Jump around**: click or drag the timeline in the inspector or at the
+4. **Jump around**: click or drag the timeline at the
    bottom, type a time (e.g. `1:23.5`) and press Return, step frame by frame
-   with ← →, or add markers (M) and click them. Markers land on the exact
-   frame. While a cue isn't playing this sets where GO starts.
+   with ← →. While a cue isn't playing this sets where GO starts.
    **Start and end points**: drag the green and red handles in the bottom
-   timeline, or press I / O to set them at the playhead.
+   timeline, type a time in the Start / End fields, or press I / O to set
+   them at the playhead.
 5. **Change speed live** with the inspector slider or the − / + buttons in the
    transport bar.
 6. **Run the show** with the keyboard:
@@ -64,7 +63,6 @@ open build/CueDeck.app
 | P | Pause / resume |
 | ← / → | One frame back / forward |
 | I / O | Start / end point at the playhead |
-| M | Marker at the playhead |
 | ⌫ | Delete the selected cues (Shift-click selects a range, ⌘-click adds single cues) |
 | Esc | Stop all cues with their stop fade |
 | ⌘. | Panic: stop everything now and close the video output |

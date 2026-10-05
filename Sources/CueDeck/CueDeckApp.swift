@@ -66,9 +66,6 @@ struct CueDeckApp: App {
                 Button("Set End Point at Playhead (O)") {
                     if let id = engine.selection { engine.setEndPoint(id, to: engine.livePlayhead(id)) }
                 }
-                Button("Add Marker at Playhead (M)") {
-                    if let id = engine.selection { engine.addMarker(id) }
-                }
                 Button("Previous Frame (←)") { if let id = engine.selection { engine.stepFrame(id, by: -1) } }
                 Button("Next Frame (→)") { if let id = engine.selection { engine.stepFrame(id, by: 1) } }
             }
@@ -137,10 +134,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case "o":                                              // end point at playhead
             guard let id = selected else { return event }
             engine.setEndPoint(id, to: engine.livePlayhead(id))
-            return nil
-        case "m":                                              // marker at playhead
-            guard let id = selected else { return event }
-            engine.addMarker(id)
             return nil
         default:
             return event

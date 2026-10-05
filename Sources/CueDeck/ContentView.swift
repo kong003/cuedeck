@@ -151,6 +151,7 @@ struct Banner: View {
             Text(text).lineLimit(3).textSelection(.enabled)
             Spacer()
             Button("Dismiss", action: dismiss).buttonStyle(.borderless)
+                .help("Hide this message")
         }
         .padding(.horizontal, 12).padding(.vertical, 6)
         .background(tint.opacity(0.15))
@@ -161,6 +162,7 @@ struct Banner: View {
 
 struct TransportBar: View {
     @EnvironmentObject var engine: PlaybackEngine
+    @AppStorage(LayoutKeys.keepInFront) private var keepInFront = false
 
     private var nextName: String {
         guard let i = engine.selectedIndex else { return engine.cues.first?.name ?? "—" }
@@ -223,6 +225,15 @@ struct TransportBar: View {
             .help(engine.showMode
                   ? "Show mode is on: minimal window, editing locked. Click to edit again (⌥⌘L)."
                   : "Show mode: minimal window for the show, locks editing (⌥⌘L)")
+
+            Button { keepInFront.toggle() } label: {
+                Label("On Top", systemImage: keepInFront ? "pin.fill" : "pin")
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(keepInFront ? .accentColor : .gray)
+            .help(keepInFront
+                  ? "CueDeck stays in front of other windows. Click to turn off."
+                  : "Keep CueDeck in front of other windows")
 
             Button {
                 engine.togglePause()
@@ -302,15 +313,18 @@ struct NowPlayingRow: View {
                 // Live speed
                 HStack(spacing: 2) {
                     Button { engine.changeSpeed(np.cueID, to: max(0.25, np.speed - 0.05)) } label: { Image(systemName: "minus") }
+                        .help("Slower by 0.05× (pitch stays the same)")
                     Text(String(format: "%.2f×", np.speed)).monospacedDigit().frame(width: 48)
+                        .help("Current speed")
                     Button { engine.changeSpeed(np.cueID, to: min(4, np.speed + 0.05)) } label: { Image(systemName: "plus") }
+                        .help("Faster by 0.05× (pitch stays the same)")
                     if np.speed != 1 {
                         Button("1×") { engine.changeSpeed(np.cueID, to: 1) }
+                            .help("Back to normal speed")
                     }
                 }
                 .buttonStyle(.borderless)
                 .fixedSize()
-                .help("Change the speed while playing")
 
                 ViewThatFits(in: .horizontal) {
                     HStack(spacing: 8) {
@@ -356,6 +370,9 @@ struct CueListView: View {
                             }
                             Divider()
                             Button("Reload Media Info") { engine.reinspect(cue.id) }
+                            if !cue.audioTracks.isEmpty && !engine.showMode {
+                                Button("Apply Default Routing") { engine.resetRoutes(for: cue.id) }
+                            }
                             Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([cue.url]) }
                             Divider()
                             if engine.showMode {
@@ -407,6 +424,7 @@ struct CueListView: View {
             Divider()
             HStack {
                 Button { engine.addFilesWithPanel() } label: { Label("Add Media", systemImage: "plus") }
+                    .help("Add video or audio files to the cue list (⌘I). You can also drop files here.")
                 Button { engine.removeSelected() } label: {
                     Label(engine.selectedIDs.count > 1 ? "Remove \(engine.selectedIDs.count)" : "Remove", systemImage: "minus")
                 }
@@ -450,7 +468,6 @@ struct CueRow: View {
         case .loop: parts.append("loop")
         case .stop, .next: break
         }
-        if !cue.markers.isEmpty { parts.append("\(cue.markers.count) marker\(cue.markers.count == 1 ? "" : "s")") }
         return parts.joined(separator: " · ")
     }
 
@@ -460,7 +477,7 @@ struct CueRow: View {
                 .font(.system(.body, design: .rounded).weight(.semibold))
                 .frame(width: 28, alignment: .trailing)
                 .foregroundStyle(.secondary)
-            Image(systemName: cue.hasVideo ? "film" : "waveform")
+            Image(systemName: cue.playsVideo ? "film" : "waveform")
                 .frame(width: 18)
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
@@ -485,6 +502,17 @@ struct CueRow: View {
                 }
             }
             Spacer()
+            if cue.hasVideo {
+                Toggle("Audio only", isOn: Binding(
+                    get: { cue.audioOnly },
+                    set: { engine.setAudioOnly(cue.id, $0) }
+                ))
+                .toggleStyle(.checkbox)
+                .font(.caption)
+                .fixedSize()
+                .disabled(engine.showMode)
+                .help("Play only the audio of this file, without video output. Applies the next time the cue starts.")
+            }
             AutoStartMenu(cue: cue, isFirst: number == 1)
                 .disabled(engine.showMode)
             if active {

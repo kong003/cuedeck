@@ -140,6 +140,8 @@ struct FileTimeline {
 struct WaveformPanel: View {
     @EnvironmentObject var engine: PlaybackEngine
     @ObservedObject private var store = WaveformStore.shared
+    /// Streams shown as one combined lane.
+    @State private var collapsed: Set<Int> = []
 
     private var cue: Cue? {
         if let id = engine.selection, let c = engine.findCue(id) { return c }
@@ -150,26 +152,7 @@ struct WaveformPanel: View {
     var body: some View {
         if let cue, cue.duration > 0 {
             VStack(alignment: .leading, spacing: 6) {
-                FlowLayout(spacing: 10, lineSpacing: 4) {
-                    Text(cue.name).font(.caption.weight(.semibold)).lineLimit(1)
-                    if engine.activeCueIDs.contains(cue.id) {
-                        Text("Playing").font(.caption).foregroundStyle(.green)
-                    }
-                    Text("Playhead \(formatTimecode(engine.playhead(for: cue.id) ?? cue.segmentStart))")
-                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                    Text("Start \(formatTimecode(cue.segmentStart)) · End \(formatTimecode(cue.segmentEnd))")
-                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                    HStack(spacing: 6) {
-                        Button("Set Start (I)") { engine.setStartPoint(cue.id, to: engine.livePlayhead(cue.id)) }
-                            .help("Set the start point at the playhead")
-                        Button("Set End (O)") { engine.setEndPoint(cue.id, to: engine.livePlayhead(cue.id)) }
-                            .help("Set the end point at the playhead")
-                        Button("Reset") { engine.clearStartEnd(cue.id) }
-                            .disabled(cue.inPoint == 0 && cue.outPoint == 0)
-                            .help("Play the whole file again")
-                    }
-                    .controlSize(.small)
-                }
+                TimelineControls(cue: cue)
 
                 HStack(spacing: 8) {
                     Color.clear.frame(width: 190, height: 1)
@@ -177,21 +160,29 @@ struct WaveformPanel: View {
                         .frame(height: 26)
                 }
 
-                if cue.audioTracks.isEmpty {
-                    Text("This cue has no audio.").font(.caption).foregroundStyle(.secondary)
-                } else {
-                    ScrollView(.vertical) {
-                        VStack(spacing: 2) {
-                            ForEach(cue.audioTracks) { track in
-                                ForEach(0..<track.channels, id: \.self) { c in
-                                    WaveformLane(cue: cue, track: track, channel: c,
-                                                 peaks: peaks(cue, track.index, c))
-                                }
-                            }
+                // Video and audio lanes scroll together.
+                ScrollView(.vertical) {
+                    VStack(spacing: 6) {
+                        if cue.hasVideo {
+                            VideoLane(cue: cue)
+                                .id(cue.id)
+                        }
+                        if cue.audioTracks.isEmpty {
+                            Text("This cue has no audio.").font(.caption).foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        ForEach(cue.audioTracks) { track in
+                            WaveformTrackGroup(
+                                cue: cue, track: track,
+                                channelPeaks: (0..<track.channels).map { peaks(cue, track.index, $0) },
+                                collapsed: Binding(
+                                    get: { collapsed.contains(track.index) },
+                                    set: { if $0 { collapsed.insert(track.index) } else { collapsed.remove(track.index) } }
+                                ))
                         }
                     }
-                    .frame(maxHeight: .infinity)
                 }
+                .frame(maxHeight: .infinity)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .padding(.horizontal, 14).padding(.vertical, 8)
@@ -245,10 +236,6 @@ struct TrimRuler: View {
                         let x = tl.x(t)
                         ctx.fill(Path(CGRect(x: x, y: 0, width: 1, height: h * 0.25)), with: .color(.secondary.opacity(0.5)))
                         t += step
-                    }
-                    for m in cue.markers {
-                        let x = tl.x(m.time)
-                        ctx.fill(Path(CGRect(x: x - 0.5, y: h * 0.25, width: 1, height: h * 0.55)), with: .color(.yellow))
                     }
                     if let p = playhead {
                         let x = tl.x(p)
@@ -304,92 +291,232 @@ struct TrimRuler: View {
     }
 }
 
-struct WaveformLane: View {
+/// Header of the bottom panel: the cue, the playhead (type a time to jump),
+/// frame and jump buttons, and the start and end points (typed or set at the playhead).
+struct TimelineControls: View {
+    @EnvironmentObject var engine: PlaybackEngine
+    let cue: Cue
+
+    private var playhead: Double { engine.playhead(for: cue.id) ?? cue.segmentStart }
+    private var isPlaying: Bool { engine.activeCueIDs.contains(cue.id) }
+
+    var body: some View {
+        FlowLayout(spacing: 10, lineSpacing: 4) {
+            HStack(spacing: 6) {
+                Text(cue.name).font(.caption.weight(.semibold)).lineLimit(1)
+                // Always as wide as the longest status, so the row never re-wraps.
+                ZStack(alignment: .leading) {
+                    Text("GO starts here").hidden()
+                    if isPlaying {
+                        Text("Playing").foregroundStyle(.green)
+                    } else if engine.pendingStarts[cue.id] != nil {
+                        Text("GO starts here").foregroundStyle(.orange)
+                    }
+                }
+                .font(.caption)
+            }
+
+            HStack(spacing: 4) {
+                TimecodeField(seconds: playhead) { engine.seek(cue.id, toFile: $0) }
+                    .frame(width: 104)
+                    .controlSize(.small)
+                Button { engine.stepFrame(cue.id, by: -1) } label: { Image(systemName: "chevron.left") }
+                    .help("One frame back (←)")
+                Button { engine.stepFrame(cue.id, by: 1) } label: { Image(systemName: "chevron.right") }
+                    .help("One frame forward (→)")
+                Button { engine.nudge(cue.id, by: -10) } label: { Image(systemName: "gobackward.10") }
+                    .help("Back 10 seconds")
+                Button { engine.nudge(cue.id, by: 10) } label: { Image(systemName: "goforward.10") }
+                    .help("Forward 10 seconds")
+                Button { engine.seek(cue.id, toFile: cue.segmentStart) } label: { Image(systemName: "backward.end.fill") }
+                    .help("Back to the start point")
+            }
+
+            HStack(spacing: 4) {
+                Text("Start").font(.caption).foregroundStyle(.green)
+                TimecodeField(seconds: cue.segmentStart) { engine.setStartPoint(cue.id, to: $0) }
+                    .frame(width: 96)
+                    .help("Type the start point (e.g. 0:12.5 or 12.5) and press Return")
+                Button("Set (I)") { engine.setStartPoint(cue.id, to: engine.livePlayhead(cue.id)) }
+                    .help("Set the start point at the playhead (I)")
+            }
+
+            HStack(spacing: 4) {
+                Text("End").font(.caption).foregroundStyle(.red)
+                TimecodeField(seconds: cue.segmentEnd) { engine.setEndPoint(cue.id, to: $0) }
+                    .frame(width: 96)
+                    .help("Type the end point (e.g. 2:10 or 130) and press Return")
+                Button("Set (O)") { engine.setEndPoint(cue.id, to: engine.livePlayhead(cue.id)) }
+                    .help("Set the end point at the playhead (O)")
+                Button("Reset") { engine.clearStartEnd(cue.id) }
+                    .disabled(cue.inPoint == 0 && cue.outPoint == 0)
+                    .help("Play the whole file again")
+            }
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+    }
+}
+
+/// One audio stream in the bottom panel: its name and routing on the left,
+/// one waveform lane per channel (or one combined lane when collapsed).
+struct WaveformTrackGroup: View {
     @EnvironmentObject var engine: PlaybackEngine
     let cue: Cue
     let track: AudioTrackInfo
-    let channel: Int
-    let peaks: [Float]?
+    let channelPeaks: [[Float]?]
+    @Binding var collapsed: Bool
 
     private var routeLabel: String {
-        guard track.index < cue.routes.count, channel < cue.routes[track.index].count else { return "Off" }
-        let o = cue.routes[track.index][channel]
-        return o >= 0 ? engine.outputName(o) : "Off"
+        switch cue.blockStart(ofTrack: track.index) {
+        case .some(-1): return "Off"
+        case .some(let s): return track.channels == 1 ? "→ \(s + 1)" : "→ \(s + 1)–\(s + track.channels)"
+        case .none: return "→ custom"
+        }
     }
+
+    /// Loudest channel at every point, for the collapsed lane.
+    private var combinedPeaks: [Float]? {
+        let all = channelPeaks.compactMap { $0 }
+        guard let first = all.first else { return nil }
+        var out = first
+        for p in all.dropFirst() {
+            for i in 0..<min(out.count, p.count) { out[i] = max(out[i], p[i]) }
+        }
+        return out
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 4) {
+                    if track.channels > 1 {
+                        Button { collapsed.toggle() } label: {
+                            Image(systemName: collapsed ? "chevron.right" : "chevron.down")
+                                .font(.system(size: 9, weight: .bold))
+                                .frame(width: 10)
+                        }
+                        .buttonStyle(.borderless)
+                        .help(collapsed ? "Show every channel" : "Show the channels as one lane")
+                    }
+                    Text(track.displayName)
+                        .font(.caption.weight(.semibold))
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                }
+                Text("\(track.channels) ch · \(routeLabel)")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .frame(width: 116, alignment: .leading)
+            .padding(.top, 3)
+            .help(track.displayName)
+
+            VStack(spacing: 2) {
+                if collapsed && track.channels > 1 {
+                    WaveformLane(cue: cue, title: "All", subtitle: "\(track.channels) ch", peaks: combinedPeaks)
+                } else {
+                    ForEach(0..<track.channels, id: \.self) { c in
+                        WaveformLane(cue: cue, title: track.defaultChannelName(c), subtitle: route(c),
+                                     peaks: c < channelPeaks.count ? channelPeaks[c] : nil)
+                    }
+                }
+            }
+        }
+        .padding(.leading, 4)
+        .padding(.vertical, 3)
+        .background(RoundedRectangle(cornerRadius: 5).fill(Color.secondary.opacity(0.07)))
+        .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.secondary.opacity(0.18)))
+    }
+
+    private func route(_ c: Int) -> String {
+        guard track.index < cue.routes.count, c < cue.routes[track.index].count else { return "Off" }
+        let o = cue.routes[track.index][c]
+        return o >= 0 ? "→ \(o + 1)" : "Off"
+    }
+}
+
+/// One channel lane: short label and the waveform.
+struct WaveformLane: View {
+    let cue: Cue
+    let title: String
+    let subtitle: String
+    let peaks: [Float]?
 
     var body: some View {
         HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 1) {
-                Text("\(track.displayName) · \(track.defaultChannelName(channel))")
-                    .font(.caption.weight(.semibold))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Text("→ \(routeLabel)")
-                    .font(.system(size: 9))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                Text(title).font(.caption).lineLimit(1)
+                Text(subtitle).font(.system(size: 9)).foregroundStyle(.secondary).lineLimit(1)
             }
-            .frame(width: 190, alignment: .leading)
-
-            GeometryReader { geo in
-                let tl = FileTimeline(duration: cue.duration, width: geo.size.width)
-                let playhead = engine.playhead(for: cue.id)
-                Canvas { ctx, size in
-                    let mid = size.height / 2
-                    ctx.fill(Path(roundedRect: CGRect(origin: .zero, size: size), cornerRadius: 3),
-                             with: .color(.secondary.opacity(0.12)))
-                    if let peaks, !peaks.isEmpty {
-                        var path = Path()
-                        let n = peaks.count
-                        let step = max(1, n / max(Int(size.width), 1))
-                        var i = 0
-                        while i < n {
-                            var p: Float = 0
-                            for j in i..<min(i + step, n) { p = max(p, peaks[j]) }
-                            let x = CGFloat(i) / CGFloat(n) * size.width
-                            let h = CGFloat(min(p, 1)) * (mid - 1)
-                            path.addRect(CGRect(x: x, y: mid - h, width: max(1, size.width / CGFloat(n) * CGFloat(step)),
-                                                height: max(0.5, h * 2)))
-                            i += step
-                        }
-                        ctx.fill(path, with: .color(.accentColor.opacity(0.85)))
-                    } else {
-                        ctx.fill(Path(CGRect(x: 0, y: mid - 0.5, width: size.width, height: 1)),
-                                 with: .color(.secondary.opacity(0.4)))
-                    }
-                    // Dim what is outside the start and end points.
-                    let sx = tl.x(cue.segmentStart), ex = tl.x(cue.segmentEnd)
-                    let shade = GraphicsContext.Shading.color(Color(nsColor: .windowBackgroundColor).opacity(0.65))
-                    if sx > 0 { ctx.fill(Path(CGRect(x: 0, y: 0, width: sx, height: size.height)), with: shade) }
-                    if ex < size.width { ctx.fill(Path(CGRect(x: ex, y: 0, width: size.width - ex, height: size.height)), with: shade) }
-                    ctx.fill(Path(CGRect(x: sx - 0.5, y: 0, width: 1, height: size.height)), with: .color(.green))
-                    ctx.fill(Path(CGRect(x: ex - 0.5, y: 0, width: 1, height: size.height)), with: .color(.red.opacity(0.8)))
-
-                    for m in cue.markers {
-                        let x = tl.x(m.time)
-                        ctx.fill(Path(CGRect(x: x - 0.5, y: 0, width: 1, height: size.height)), with: .color(.yellow))
-                    }
-                    if let playhead {
-                        let x = tl.x(playhead)
-                        ctx.fill(Path(CGRect(x: x - 1, y: 0, width: 2, height: size.height)), with: .color(.red))
-                    }
-                }
-                .contentShape(Rectangle())
-                .gesture(
-                    DragGesture(minimumDistance: 0)
-                        .onChanged { v in
-                            if abs(v.translation.width) > 2 {
-                                engine.scrub(cue.id, toFile: tl.time(v.location.x))
-                            }
-                        }
-                        .onEnded { v in
-                            engine.seek(cue.id, toFile: tl.time(v.location.x))
-                        }
-                )
-            }
+            .frame(width: 62, alignment: .leading)
+            WaveformStrip(cue: cue, peaks: peaks)
         }
-        .frame(height: 34)
+        .frame(height: 30)
+    }
+}
+
+/// Waveform over the whole file with start/end points and the
+/// playhead. Click or drag to move the playhead.
+struct WaveformStrip: View {
+    @EnvironmentObject var engine: PlaybackEngine
+    let cue: Cue
+    let peaks: [Float]?
+
+    var body: some View {
+        GeometryReader { geo in
+            let tl = FileTimeline(duration: cue.duration, width: geo.size.width)
+            let playhead = engine.playhead(for: cue.id)
+            Canvas { ctx, size in
+                let mid = size.height / 2
+                ctx.fill(Path(roundedRect: CGRect(origin: .zero, size: size), cornerRadius: 3),
+                         with: .color(.secondary.opacity(0.12)))
+                if let peaks, !peaks.isEmpty {
+                    var path = Path()
+                    let n = peaks.count
+                    let step = max(1, n / max(Int(size.width), 1))
+                    var i = 0
+                    while i < n {
+                        var p: Float = 0
+                        for j in i..<min(i + step, n) { p = max(p, peaks[j]) }
+                        let x = CGFloat(i) / CGFloat(n) * size.width
+                        let h = CGFloat(min(p, 1)) * (mid - 1)
+                        path.addRect(CGRect(x: x, y: mid - h, width: max(1, size.width / CGFloat(n) * CGFloat(step)),
+                                            height: max(0.5, h * 2)))
+                        i += step
+                    }
+                    ctx.fill(path, with: .color(.accentColor.opacity(0.85)))
+                } else {
+                    ctx.fill(Path(CGRect(x: 0, y: mid - 0.5, width: size.width, height: 1)),
+                             with: .color(.secondary.opacity(0.4)))
+                }
+                // Dim what is outside the start and end points.
+                let sx = tl.x(cue.segmentStart), ex = tl.x(cue.segmentEnd)
+                let shade = GraphicsContext.Shading.color(Color(nsColor: .windowBackgroundColor).opacity(0.65))
+                if sx > 0 { ctx.fill(Path(CGRect(x: 0, y: 0, width: sx, height: size.height)), with: shade) }
+                if ex < size.width { ctx.fill(Path(CGRect(x: ex, y: 0, width: size.width - ex, height: size.height)), with: shade) }
+                ctx.fill(Path(CGRect(x: sx - 0.5, y: 0, width: 1, height: size.height)), with: .color(.green))
+                ctx.fill(Path(CGRect(x: ex - 0.5, y: 0, width: 1, height: size.height)), with: .color(.red.opacity(0.8)))
+
+                if let playhead {
+                    let x = tl.x(playhead)
+                    ctx.fill(Path(CGRect(x: x - 1, y: 0, width: 2, height: size.height)), with: .color(.red))
+                }
+            }
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { v in
+                        if abs(v.translation.width) > 2 {
+                            engine.scrub(cue.id, toFile: tl.time(v.location.x))
+                        }
+                    }
+                    .onEnded { v in
+                        engine.seek(cue.id, toFile: tl.time(v.location.x))
+                    }
+            )
+        }
     }
 }
 

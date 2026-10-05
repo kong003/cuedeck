@@ -407,6 +407,13 @@ final class PlaybackEngine: NSObject, ObservableObject {
         updateCue(cue)
     }
 
+    /// Applies the next time the cue starts.
+    func setAudioOnly(_ id: UUID, _ on: Bool) {
+        guard !showMode, var cue = findCue(id) else { return }
+        cue.audioOnly = on
+        updateCue(cue)
+    }
+
     func setAutoStart(_ id: UUID, _ mode: AutoStart) {
         guard !showMode, var cue = findCue(id) else { return }
         cue.autoStart = mode
@@ -559,7 +566,7 @@ final class PlaybackEngine: NSObject, ObservableObject {
         }
     }
 
-    /// Click on a timeline, a marker, or a typed timecode. Lands on the
+    /// Click on a timeline or a typed timecode. Lands on the
     /// video frame that contains `seconds`.
     func seek(_ id: UUID, toFile seconds: Double) {
         if let s = activeSession(for: id) {
@@ -628,14 +635,6 @@ final class PlaybackEngine: NSObject, ObservableObject {
     func changeSpeed(_ id: UUID, to speed: Double) {
         guard var cue = findCue(id) else { return }
         cue.speed = (speed * 100).rounded() / 100
-        updateCue(cue)
-    }
-
-    func addMarker(_ id: UUID) {
-        guard !showMode, var cue = findCue(id) else { return }
-        let t = cue.frameStart(livePlayhead(id))
-        cue.markers.append(Marker(name: "Marker \(cue.markers.count + 1)", time: t))
-        cue.markers.sort { $0.time < $1.time }
         updateCue(cue)
     }
 
@@ -746,6 +745,22 @@ final class PlaybackEngine: NSObject, ObservableObject {
         cues = loaded
         pendingStarts = [:]
         selection = cues.first?.id
+        refreshStreamNames()
+    }
+
+    /// Reads the stream names from the files again (shows saved before
+    /// CueDeck read them, or files that changed).
+    private func refreshStreamNames() {
+        let list = cues.filter { !$0.missing && !$0.audioTracks.isEmpty }.map { ($0.id, $0.url) }
+        Task {
+            for (id, url) in list {
+                guard let names = await MediaInspector.trackNames(of: url), var cue = findCue(id),
+                      names.count == cue.audioTracks.count,
+                      names != cue.audioTracks.map(\.fileName) else { continue }
+                for i in names.indices { cue.audioTracks[i].fileName = names[i] }
+                updateCue(cue)
+            }
+        }
     }
 
     func newShow() {

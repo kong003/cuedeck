@@ -96,7 +96,7 @@ final class PlaybackSession: Identifiable {
     /// Loads everything so that start(at:) is instant. Playback begins at
     /// media time `position`.
     func prepare(fromMedia position: Double = 0) async throws {
-        let timeline = try await CueTimeline.build(for: cue, audioSpeed: speed)
+        let timeline = try await CueTimeline.build(for: cue, audioSpeed: speed, includeVideo: cue.playsVideo)
         if isCancelled { return }
         mediaDuration = timeline.mediaDuration
         let begin = clampMedia(position)
@@ -477,7 +477,6 @@ final class PlaybackSession: Identifiable {
         cue.stopFade = newCue.stopFade
         cue.name = newCue.name
         cue.audioTracks = newCue.audioTracks
-        cue.markers = newCue.markers
         cue.speed = newCue.speed
         if voice >= 0, let out = output {
             cm_voice_set_gain(out.mixer, voice, cue.linearGain)
@@ -531,7 +530,7 @@ final class PlaybackSession: Identifiable {
     var fileTime: Double { cue.fileTime(forMedia: mediaTime) }
 
     /// File time of the video frame on screen right now (falls back to the
-    /// audio position for cues without video). Used for exact markers.
+    /// audio position for cues without video). Used for exact frame steps.
     var displayedFileTime: Double {
         if let p = player, state != .preparing, !seeking {
             let t = p.currentTime().seconds

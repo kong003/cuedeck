@@ -16,6 +16,7 @@ struct InspectorPane: View {
                 Button(role: .destructive) { engine.removeSelected() } label: {
                     Label("Delete \(engine.selectedIDs.count) Cues", systemImage: "trash")
                 }
+                .help("Delete the selected cues from the list (⌫)")
                 Spacer()
             }
             .padding()
@@ -24,7 +25,7 @@ struct InspectorPane: View {
             CueInspector(cue: Binding(
                 get: { engine.findCue(id) ?? cue },
                 set: { engine.updateCue($0) }
-            ), outputChannels: engine.routingChannels)
+            ))
             .id(id)
         } else {
             VStack {
@@ -40,7 +41,6 @@ struct InspectorPane: View {
 struct CueInspector: View {
     @EnvironmentObject var engine: PlaybackEngine
     @Binding var cue: Cue
-    let outputChannels: Int
 
     var body: some View {
         Form {
@@ -54,14 +54,16 @@ struct CueInspector: View {
                 LabeledContent("Duration", value: formatTime(cue.duration))
                 LabeledContent("Video", value: cue.hasVideo ? (cue.videoSize.isEmpty ? "Yes" : cue.videoSize) : "None")
                 LabeledContent("Audio", value: cue.audioTracks.isEmpty ? "None" :
-                    "\(cue.audioTracks.count) stream(s), \(cue.audioTracks.reduce(0) { $0 + $1.channels }) channels")
+                    "\(cue.audioTracks.count) stream\(cue.audioTracks.count == 1 ? "" : "s"), \(cue.audioTracks.reduce(0) { $0 + $1.channels }) channels")
             }
 
             Section {
                 LabeledContent("Speed") {
                     HStack {
                         Slider(value: $cue.speed, in: 0.25...4.0)
+                            .help("Speed from 0.25× to 4×, the pitch stays the same")
                         NumberField(value: $cue.speed, digits: 2, width: 56)
+                            .help("Type the speed and press Return")
                         Text("×")
                     }
                 }
@@ -71,11 +73,13 @@ struct CueInspector: View {
                             .buttonStyle(.bordered)
                             .controlSize(.small)
                             .tint(cue.speed == s ? Color.accentColor : nil)
+                            .help("Set the speed to \(String(format: "%g", s))×")
                     }
                 }
                 LabeledContent("Volume") {
                     HStack {
                         Slider(value: $cue.volumeDB, in: -60...12)
+                            .help("Volume of this cue, -60 dB (silent) to +12 dB")
                         TextField("0", value: $cue.volumeDB, format: .number.precision(.fractionLength(0...1)))
                             .textFieldStyle(.roundedBorder)
                             .multilineTextAlignment(.trailing)
@@ -85,36 +89,30 @@ struct CueInspector: View {
                     }
                 }
                 SecondsRow(title: "Fade in", value: $cue.fadeIn)
+                    .help("Seconds the cue fades in from silence when it starts")
                 SecondsRow(title: "Fade out", value: $cue.fadeOut)
                     .disabled(cue.endAction == .loop)
+                    .help("Seconds the cue fades out before it reaches its end")
                 SecondsRow(title: "Fade on stop", value: $cue.stopFade)
+                    .help("Seconds the cue fades out when it is stopped, e.g. by Stop or by GO on another cue")
                 TimeRow(title: "Start point", value: $cue.inPoint, placeholder: "00:00.00")
+                    .help("Where in the file the cue starts. Type a time like 1:23.5, empty = beginning")
                 TimeRow(title: "End point", value: $cue.outPoint, placeholder: "end of file")
+                    .help("Where in the file the cue ends. Type a time like 2:10, empty = end of file")
+                if cue.hasVideo {
+                    Toggle("Audio only (no video output)", isOn: $cue.audioOnly)
+                        .help("Play only the audio of this file. Applies the next time the cue starts.")
+                }
                 Picker("When finished", selection: $cue.endAction) {
                     ForEach(EndAction.selectable) { Text($0.label).tag($0) }
                 }
+                .help("Stop at the end, or loop seamlessly until stopped")
                 LabeledContent("Plays for", value: cue.endAction == .loop ? "Until stopped" : formatTime(cue.playDuration))
             } header: {
                 Text("Playback")
             } footer: {
                 Text("Speed keeps the pitch. Speed, volume and routing change instantly while the cue plays.")
                     .font(.caption).foregroundStyle(.secondary)
-            }
-
-            Section("Timeline") {
-                CueTimelineSection(cue: $cue)
-            }
-
-            Section {
-                RoutingEditor(cue: $cue, outputChannels: outputChannels)
-            } header: {
-                HStack {
-                    Text("Audio routing")
-                    Spacer()
-                    Button("Apply Default") { engine.resetRoutes(for: cue.id) }
-                        .controlSize(.small)
-                        .help("Route this cue with the default routing from Settings (⌘,)")
-                }
             }
         }
         .formStyle(.grouped)
@@ -206,10 +204,6 @@ struct StreamRouteMenu: View {
         }
     }
 
-    private var streamLabel: String {
-        track.name.trimmingCharacters(in: .whitespaces).isEmpty ? "S\(track.index + 1)" : track.name
-    }
-
     var body: some View {
         Menu {
             item("Off", selected: cue.blockStart(ofTrack: track.index) == -1) { set(-1) }
@@ -229,7 +223,7 @@ struct StreamRouteMenu: View {
                 }
             }
         } label: {
-            Text(compact ? "\(streamLabel) → \(currentLabel)" : currentLabel)
+            Text(compact ? "\(track.displayName) → \(currentLabel)" : currentLabel)
                 .lineLimit(1)
         }
         .menuStyle(.borderlessButton)
@@ -246,80 +240,6 @@ struct StreamRouteMenu: View {
 
     private func set(_ start: Int) {
         engine.setTrackBlock(cueID: cue.id, track: track.index, start: start)
-    }
-}
-
-struct RoutingEditor: View {
-    @EnvironmentObject var engine: PlaybackEngine
-    @Binding var cue: Cue
-    let outputChannels: Int
-    @State private var expanded: Set<Int> = []
-
-    var body: some View {
-        if cue.audioTracks.isEmpty {
-            Text("This file has no audio.").foregroundStyle(.secondary)
-        } else {
-            ForEach(cue.audioTracks) { track in
-                VStack(alignment: .leading, spacing: 6) {
-                    FlowLayout(spacing: 8, lineSpacing: 4) {
-                        TextField(track.label, text: trackName(track.index))
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 170)
-                            .help("Rename this audio stream")
-                        StreamRouteMenu(cue: cue, track: track)
-                    }
-                    DisclosureGroup(isExpanded: Binding(
-                        get: { expanded.contains(track.index) },
-                        set: { if $0 { expanded.insert(track.index) } else { expanded.remove(track.index) } }
-                    )) {
-                        ForEach(0..<track.channels, id: \.self) { c in
-                            HStack {
-                                Text(track.defaultChannelName(c))
-                                    .foregroundStyle(.secondary)
-                                    .frame(width: 50, alignment: .leading)
-                                Image(systemName: "arrow.right").foregroundStyle(.tertiary)
-                                Picker("", selection: route(track.index, c)) {
-                                    Text("Off").tag(-1)
-                                    ForEach(0..<max(outputChannels, 1), id: \.self) { o in
-                                        Text(engine.outputName(o)).tag(o)
-                                    }
-                                }
-                                .labelsHidden()
-                                .frame(minWidth: 130)
-                                Spacer()
-                            }
-                        }
-                    } label: {
-                        Text("\(track.channels) channel\(track.channels == 1 ? "" : "s") · \(track.label)")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                }
-                .padding(.vertical, 2)
-            }
-        }
-    }
-
-    private func trackName(_ t: Int) -> Binding<String> {
-        Binding(
-            get: { t < cue.audioTracks.count ? cue.audioTracks[t].name : "" },
-            set: { if t < cue.audioTracks.count { cue.audioTracks[t].name = $0 } }
-        )
-    }
-
-    private func route(_ track: Int, _ channel: Int) -> Binding<Int> {
-        Binding(
-            get: {
-                guard track < cue.routes.count, channel < cue.routes[track].count else { return -1 }
-                return cue.routes[track][channel]
-            },
-            set: { newValue in
-                var routes = cue.routes
-                while routes.count <= track { routes.append([]) }
-                while routes[track].count <= channel { routes[track].append(-1) }
-                routes[track][channel] = newValue
-                cue.routes = routes
-            }
-        )
     }
 }
 
@@ -346,11 +266,13 @@ struct OutputBar: View {
                     }
                     .labelsHidden()
                     .frame(width: 260)
+                    .help("Audio device all cues play on, e.g. Dante Virtual Soundcard")
                     Button { engine.refreshDevices() } label: { Image(systemName: "arrow.clockwise") }
                         .buttonStyle(.borderless)
                         .help("Rescan audio devices")
                     Button("Output names…") { showNames = true }
                         .controlSize(.small)
+                        .help("Name the output channels of this device, e.g. FOH L, FOH R")
                 }
 
                 HStack(spacing: 6) {
@@ -362,11 +284,13 @@ struct OutputBar: View {
                     }
                     .labelsHidden()
                     .frame(width: 220)
+                    .help("Display the video plays on (full screen)")
                 }
 
                 HStack(spacing: 4) {
                     Text("Master")
                     Slider(value: $engine.masterDB, in: -60...6).frame(width: 110)
+                        .help("Master volume for all cues, -60 dB (silent) to +6 dB")
                     TextField("0", value: $engine.masterDB, format: .number.precision(.fractionLength(0...1)))
                         .textFieldStyle(.roundedBorder)
                         .multilineTextAlignment(.trailing)

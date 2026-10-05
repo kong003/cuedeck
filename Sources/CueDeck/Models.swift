@@ -53,8 +53,9 @@ enum AutoStart: String, Codable, CaseIterable, Identifiable {
 struct AudioTrackInfo: Codable, Equatable, Identifiable {
     var index: Int          // order among the file's audio tracks
     var channels: Int
-    var label: String       // detected, e.g. "Track 2 · 2 ch · deu"
+    var label: String       // detected, e.g. "Stream 2 · 2 ch · deu"
     var name: String = ""   // user-given name, empty = use label
+    var fileName: String = "" // name stored in the media file, if any
     var channelNames: [String] = []
     var id: Int { index }
 
@@ -64,7 +65,14 @@ struct AudioTrackInfo: Codable, Equatable, Identifiable {
         self.label = label
     }
 
-    var displayName: String { name.trimmingCharacters(in: .whitespaces).isEmpty ? label : name }
+    /// Shown everywhere in the app: the user's name, else "Stream 1" plus the
+    /// name from the file ("Stream 1 · English").
+    var displayName: String {
+        let n = name.trimmingCharacters(in: .whitespaces)
+        if !n.isEmpty { return n }
+        let f = fileName.trimmingCharacters(in: .whitespaces)
+        return f.isEmpty ? "Stream \(index + 1)" : "Stream \(index + 1) · \(f)"
+    }
 
     func defaultChannelName(_ c: Int) -> String {
         if channels == 1 { return "Mono" }
@@ -79,14 +87,17 @@ struct AudioTrackInfo: Codable, Equatable, Identifiable {
         return defaultChannelName(c)
     }
 
-    enum CodingKeys: String, CodingKey { case index, channels, label, name, channelNames }
+    enum CodingKeys: String, CodingKey { case index, channels, label, name, fileName, channelNames }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         index = try c.decode(Int.self, forKey: .index)
         channels = try c.decode(Int.self, forKey: .channels)
-        label = try c.decodeIfPresent(String.self, forKey: .label) ?? "Track \(index + 1)"
+        label = try c.decodeIfPresent(String.self, forKey: .label) ?? "Stream \(index + 1)"
+        // Older shows saved "Track 2 · 2 ch".
+        if label.hasPrefix("Track ") { label = "Stream " + label.dropFirst("Track ".count) }
         name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
+        fileName = try c.decodeIfPresent(String.self, forKey: .fileName) ?? ""
         channelNames = try c.decodeIfPresent([String].self, forKey: .channelNames) ?? []
     }
 }
@@ -98,13 +109,6 @@ enum RoutingDefault {
     static let off = -1
     /// Streams listed in the settings (a cue plays up to 16 audio tracks).
     static let streams = 16
-}
-
-/// A named position in a cue, in seconds of the source file.
-struct Marker: Codable, Equatable, Identifiable {
-    var id = UUID()
-    var name: String
-    var time: Double
 }
 
 /// A playable item in the cue list.
@@ -123,12 +127,13 @@ struct Cue: Identifiable, Codable, Equatable {
     var outPoint: Double = 0           // seconds into the source file, 0 = until the end
     var endAction: EndAction = .stop
     var autoStart: AutoStart = .off
+    /// Play only the audio of a video file (no video output).
+    var audioOnly: Bool = false
     /// Start without stopping cues that are already playing.
     var playAlongside: Bool = false
 
     /// routes[track][channel] = output channel (0 based), -1 = off.
     var routes: [[Int]] = []
-    var markers: [Marker] = []
 
     // Media information (filled in when the file is inspected)
     var duration: Double = 0           // source duration in seconds
@@ -142,6 +147,9 @@ struct Cue: Identifiable, Codable, Equatable {
         self.url = url
         self.name = url.deletingPathExtension().lastPathComponent
     }
+
+    /// Whether playing this cue shows video.
+    var playsVideo: Bool { hasVideo && !audioOnly }
 
     /// End of the selected part, in source seconds.
     var segmentEnd: Double { outPoint > 0 ? min(outPoint, duration) : duration }
@@ -257,7 +265,7 @@ struct Cue: Identifiable, Codable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case id, url, name, speed, volumeDB, fadeIn, fadeOut, stopFade, inPoint, outPoint,
-             endAction, autoStart, playAlongside, routes, markers, duration, hasVideo, videoSize, frameRate, audioTracks
+             endAction, autoStart, audioOnly, playAlongside, routes, duration, hasVideo, videoSize, frameRate, audioTracks
     }
 
     init(from decoder: Decoder) throws {
@@ -274,9 +282,9 @@ struct Cue: Identifiable, Codable, Equatable {
         outPoint = try c.decodeIfPresent(Double.self, forKey: .outPoint) ?? 0
         endAction = try c.decodeIfPresent(EndAction.self, forKey: .endAction) ?? .stop
         autoStart = try c.decodeIfPresent(AutoStart.self, forKey: .autoStart) ?? .off
+        audioOnly = try c.decodeIfPresent(Bool.self, forKey: .audioOnly) ?? false
         playAlongside = try c.decodeIfPresent(Bool.self, forKey: .playAlongside) ?? false
         routes = try c.decodeIfPresent([[Int]].self, forKey: .routes) ?? []
-        markers = try c.decodeIfPresent([Marker].self, forKey: .markers) ?? []
         duration = try c.decodeIfPresent(Double.self, forKey: .duration) ?? 0
         hasVideo = try c.decodeIfPresent(Bool.self, forKey: .hasVideo) ?? false
         videoSize = try c.decodeIfPresent(String.self, forKey: .videoSize) ?? ""
@@ -298,9 +306,9 @@ struct Cue: Identifiable, Codable, Equatable {
         try c.encode(outPoint, forKey: .outPoint)
         try c.encode(endAction, forKey: .endAction)
         try c.encode(autoStart, forKey: .autoStart)
+        try c.encode(audioOnly, forKey: .audioOnly)
         try c.encode(playAlongside, forKey: .playAlongside)
         try c.encode(routes, forKey: .routes)
-        try c.encode(markers, forKey: .markers)
         try c.encode(duration, forKey: .duration)
         try c.encode(hasVideo, forKey: .hasVideo)
         try c.encode(videoSize, forKey: .videoSize)

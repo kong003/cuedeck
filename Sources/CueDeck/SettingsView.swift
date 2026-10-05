@@ -37,7 +37,7 @@ struct DefaultRoutingSettings: View {
             } header: {
                 Text("Default routing for new cues")
             } footer: {
-                Text("Each stream starts at the chosen output, its channels go to the outputs that follow (a stereo stream from output 5 plays on 5–6). Automatic continues right after the previous stream. Applies to added files and to Apply Default in the inspector.")
+                Text("Each stream starts at the chosen output, its channels go to the outputs that follow (a stereo stream from output 5 plays on 5–6). Automatic continues right after the previous stream. Applies to added files and to Apply Default Routing in the context menu of a cue.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -45,9 +45,11 @@ struct DefaultRoutingSettings: View {
                 HStack {
                     Button("Reset to Automatic") { engine.defaultRouting = [] }
                         .disabled(engine.defaultRouting.isEmpty)
+                        .help("Set every stream back to Automatic (1–2, 3–4, …)")
                     Spacer()
                     Button("Apply to All Cues…") { confirmApplyAll = true }
                         .disabled(engine.cues.isEmpty)
+                        .help("Replace the routing of every cue in the list with this default routing")
                 }
             }
         }

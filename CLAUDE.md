@@ -39,7 +39,7 @@ mixer, one small Objective-C helper. macOS 13+, Apple Silicon.
   voice at an exact host time while the video changes rate at the same moment).
   AVPlayer uses the audio device clock as `sourceClock` so video never drifts.
 - `PlaybackEngine.swift`: app state (cue list, selection incl. multi-select,
-  devices, screens, output names), GO / GO + KEEP, timeline seeking, markers,
+  devices, screens, output names), GO / GO + KEEP, timeline seeking,
   start/end points, autosave, Finder file opening.
 - `VideoOutput.swift`: borderless window on the chosen display. It must exist
   only while a cue with video plays (user requirement).
@@ -58,8 +58,8 @@ mixer, one small Objective-C helper. macOS 13+, Apple Silicon.
 - Only pass an `AVChannelLayoutKey` whose channel count matches the track.
 - `NSWorkspace.setDefaultApplication` async label is `at:toOpen:`.
 - Seeks use `Cue.seekTarget` (+¼ frame) so rounding never lands on the
-  previous frame; markers are stored at frame starts (`Cue.frameStart`).
-- Keyboard shortcuts (Space, ⇧Space, Esc, P, ⌫, ←/→, I, O, M) are handled
+  previous frame; start/end points are stored at frame starts (`Cue.frameStart`).
+- Keyboard shortcuts (Space, ⇧Space, Esc, P, ⌫, ←/→, I, O) are handled
   in `AppDelegate.handleKey` and ignored while a text field or sheet is active.
 
 ## Product decisions (from the owner)
