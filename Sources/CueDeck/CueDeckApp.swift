@@ -28,6 +28,14 @@ struct CueDeckApp: App {
                 Button("Add Media…") { engine.addFilesWithPanel() }
                     .keyboardShortcut("i")
             }
+            CommandGroup(replacing: .undoRedo) {
+                Button("Undo") { engine.undo() }
+                    .keyboardShortcut("z")
+                    .disabled(!engine.canUndo || engine.showMode)
+                Button("Redo") { engine.redo() }
+                    .keyboardShortcut("z", modifiers: [.command, .shift])
+                    .disabled(!engine.canRedo || engine.showMode)
+            }
             CommandGroup(replacing: .saveItem) {
                 Button("Save Show") { engine.saveShow() }
                     .keyboardShortcut("s")
@@ -93,7 +101,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func handleKey(_ event: NSEvent) -> NSEvent? {
         // Let text fields receive spaces, letters and backspace, and leave
         // sheets (e.g. Output names) alone.
-        if NSApp.keyWindow?.firstResponder is NSText { return event }
+        if let window = NSApp.keyWindow, window.firstResponder is NSText {
+            // Return, Enter and Esc finish typing and leave the field, so the
+            // show keys (Space = GO) work again right away.
+            if [36, 76, 53].contains(event.keyCode), !window.isSheet, window.attachedSheet == nil {
+                DispatchQueue.main.async { window.makeFirstResponder(nil) }
+                return event.keyCode == 53 ? nil : event
+            }
+            return event
+        }
         if NSApp.keyWindow?.isSheet == true || NSApp.keyWindow?.attachedSheet != nil { return event }
         // Never GO or delete cues from the Settings window.
         if NSApp.keyWindow?.identifier?.rawValue.localizedCaseInsensitiveContains("settings") == true { return event }

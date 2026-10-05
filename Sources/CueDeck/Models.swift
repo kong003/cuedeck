@@ -35,7 +35,7 @@ enum AutoStart: String, Codable, CaseIterable, Identifiable {
     }
     var shortLabel: String {
         switch self {
-        case .off: return "Manual"
+        case .off: return "No autostart"
         case .afterPrevious: return "After previous"
         case .withPrevious: return "With previous"
         }

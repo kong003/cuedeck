@@ -29,7 +29,8 @@ open build/CueDeck.app
    - **Video output**: the display the video goes to. A borderless window opens
      there only while a cue with video is playing and closes as soon as nothing
      plays.
-2. **Add media**: drag files onto the cue list, or use File › Add Media (⌘I).
+2. **Add media**: drag files onto the cue list (they are inserted where you
+   drop them), or use File › Add Media (⌘I).
 3. **Set each cue** in the inspector on the right:
    - Speed 0.25× to 4× (pitch preserved)
    - Volume, fade in, fade out at the end, fade when stopped
@@ -58,6 +59,8 @@ open build/CueDeck.app
 | --- | --- |
 | Space | GO: play the selected cue (fades out what is playing), select the next one |
 | ⇧ Space | GO + KEEP: play the selected cue and keep everything else playing |
+| ⌘Z / ⇧⌘Z | Undo / redo changes to the cue list |
+| Return / Esc | Leave a text field, so Space is GO again |
 | ⌥⌘L | Show mode: minimal window, editing locked |
 | ⌥⌘I / ⌥⌘B | Hide or show the inspector / the timeline and waveforms |
 | P | Pause / resume |

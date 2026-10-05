@@ -30,7 +30,9 @@ struct FlowLayout: Layout {
         var lines: [[(Subviews.Element, CGSize)]] = [[]]
         var x: CGFloat = 0
         for view in subviews {
-            let size = view.sizeThatFits(.unspecified)
+            var size = view.sizeThatFits(.unspecified)
+            // An item wider than the whole row is squeezed instead of drawn over its neighbours.
+            if size.width > bounds.width { size = view.sizeThatFits(ProposedViewSize(width: bounds.width, height: nil)) }
             if x > 0 && x + size.width > bounds.width {
                 lines.append([])
                 x = 0

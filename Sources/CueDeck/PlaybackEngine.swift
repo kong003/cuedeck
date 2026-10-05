@@ -22,7 +22,24 @@ final class PlaybackEngine: NSObject, ObservableObject {
     static let shared = PlaybackEngine()
 
     // Show
-    @Published var cues: [Cue] = [] { didSet { scheduleAutosave() } }
+    @Published var cues: [Cue] = [] {
+        didSet {
+            scheduleAutosave()
+            recordUndo(oldValue)
+        }
+    }
+
+    // Undo: snapshots of the cue list. Changes within `undoGrouping` seconds
+    // (slider drags, typing) form one step.
+    @Published private(set) var canUndo = false
+    @Published private(set) var canRedo = false
+    private var undoStack: [[Cue]] = [] { didSet { canUndo = !undoStack.isEmpty } }
+    private var redoStack: [[Cue]] = [] { didSet { canRedo = !redoStack.isEmpty } }
+    private var lastUndoRecord = Date.distantPast
+    /// Set while the app itself changes the list (loading, undo, reading file info).
+    private var suppressUndo = false
+    private let undoGrouping: TimeInterval = 0.8
+    private let undoLimit = 100
     /// The cue GO plays next and the inspector shows.
     @Published var selection: UUID? { didSet { syncSetFromSelection() } }
     /// All selected cues in the list (Shift-click for a range, ⌘-click to add).
@@ -251,6 +268,53 @@ final class PlaybackEngine: NSObject, ObservableObject {
 
     func findCue(_ id: UUID) -> Cue? { cues.first { $0.id == id } }
 
+    // MARK: - Undo
+
+    private func recordUndo(_ old: [Cue]) {
+        guard !suppressUndo, old != cues else { return }
+        let now = Date()
+        if now.timeIntervalSince(lastUndoRecord) > undoGrouping {
+            undoStack.append(old)
+            if undoStack.count > undoLimit { undoStack.removeFirst() }
+        }
+        lastUndoRecord = now
+        redoStack.removeAll()
+    }
+
+    /// Changes the list without creating an undo step.
+    private func withoutUndo(_ change: () -> Void) {
+        suppressUndo = true
+        change()
+        suppressUndo = false
+    }
+
+    private func clearUndo() {
+        undoStack.removeAll()
+        redoStack.removeAll()
+    }
+
+    func undo() {
+        guard !showMode, let previous = undoStack.popLast() else { return }
+        redoStack.append(cues)
+        restore(previous)
+    }
+
+    func redo() {
+        guard !showMode, let next = redoStack.popLast() else { return }
+        undoStack.append(cues)
+        restore(next)
+    }
+
+    private func restore(_ list: [Cue]) {
+        withoutUndo { cues = list }
+        lastUndoRecord = .distantPast
+        // Playing cues take over restored volume, speed and routing.
+        for s in sessions where s.state != .finished {
+            if let c = findCue(s.cue.id) { s.update(cue: c) }
+        }
+        if let sel = selection, findCue(sel) == nil { selection = cues.first?.id }
+    }
+
     /// Called by the inspector; applies volume, routing and speed live to a playing cue.
     func updateCue(_ edited: Cue) {
         let cue = edited.sanitized()
@@ -259,10 +323,15 @@ final class PlaybackEngine: NSObject, ObservableObject {
         for s in sessions where s.cue.id == cue.id && s.state != .finished { s.update(cue: cue) }
     }
 
-    func addFiles(_ urls: [URL], selectAdded: Bool = false) {
+    /// Adds files to the list, at `index` (where they were dropped) or at the end.
+    func addFiles(_ urls: [URL], selectAdded: Bool = false, at index: Int? = nil) {
         Task {
+            var insertAt = index
             for url in urls {
-                if let id = await addFile(url), selectAdded { selection = id }
+                if let id = await addFile(url, at: insertAt) {
+                    if selectAdded { selection = id }
+                    insertAt = insertAt.map { $0 + 1 }
+                }
             }
         }
     }
@@ -283,7 +352,7 @@ final class PlaybackEngine: NSObject, ObservableObject {
     }
 
     @discardableResult
-    private func addFile(_ original: URL) async -> UUID? {
+    private func addFile(_ original: URL, at index: Int? = nil) async -> UUID? {
         var url = original
         let ext = url.pathExtension.lowercased()
         if MediaInspector.needsConversion.contains(ext) {
@@ -310,7 +379,7 @@ final class PlaybackEngine: NSObject, ObservableObject {
             }
         }
         cue.normalizeRoutes(outputChannels: routingChannels, defaults: defaultRouting)
-        cues.append(cue)
+        if let index { cues.insert(cue, at: min(max(index, 0), cues.count)) } else { cues.append(cue) }
         if selection == nil { selection = cue.id }
         return cue.id
     }
@@ -742,7 +811,8 @@ final class PlaybackEngine: NSObject, ObservableObject {
                 if i + 1 < loaded.count && loaded[i + 1].autoStart == .off { loaded[i + 1].autoStart = .afterPrevious }
             }
         }
-        cues = loaded
+        withoutUndo { cues = loaded }
+        clearUndo()
         pendingStarts = [:]
         selection = cues.first?.id
         refreshStreamNames()
@@ -758,7 +828,7 @@ final class PlaybackEngine: NSObject, ObservableObject {
                       names.count == cue.audioTracks.count,
                       names != cue.audioTracks.map(\.fileName) else { continue }
                 for i in names.indices { cue.audioTracks[i].fileName = names[i] }
-                updateCue(cue)
+                withoutUndo { updateCue(cue) }
             }
         }
     }
@@ -766,7 +836,8 @@ final class PlaybackEngine: NSObject, ObservableObject {
     func newShow() {
         stopAll(fade: false)
         showURL = nil
-        cues = []
+        withoutUndo { cues = [] }
+        clearUndo()
         pendingStarts = [:]
         selection = nil
     }

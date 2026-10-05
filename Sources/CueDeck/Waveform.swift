@@ -140,8 +140,10 @@ struct FileTimeline {
 struct WaveformPanel: View {
     @EnvironmentObject var engine: PlaybackEngine
     @ObservedObject private var store = WaveformStore.shared
-    /// Streams shown as one combined lane.
+    /// Streams of the shown cue drawn as one combined lane; remembered per cue.
     @State private var collapsed: Set<Int> = []
+
+    private static func collapsedKey(_ id: UUID) -> String { "collapsedStreams.\(id.uuidString)" }
 
     private var cue: Cue? {
         if let id = engine.selection, let c = engine.findCue(id) { return c }
@@ -177,7 +179,10 @@ struct WaveformPanel: View {
                                 channelPeaks: (0..<track.channels).map { peaks(cue, track.index, $0) },
                                 collapsed: Binding(
                                     get: { collapsed.contains(track.index) },
-                                    set: { if $0 { collapsed.insert(track.index) } else { collapsed.remove(track.index) } }
+                                    set: {
+                                        if $0 { collapsed.insert(track.index) } else { collapsed.remove(track.index) }
+                                        UserDefaults.standard.set(Array(collapsed).sorted(), forKey: Self.collapsedKey(cue.id))
+                                    }
                                 ))
                         }
                     }
@@ -187,6 +192,9 @@ struct WaveformPanel: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .padding(.horizontal, 14).padding(.vertical, 8)
             .task(id: WaveformStore.key(for: cue)) { store.load(cue) }
+            .task(id: cue.id) {
+                collapsed = Set(UserDefaults.standard.array(forKey: Self.collapsedKey(cue.id)) as? [Int] ?? [])
+            }
         } else {
             HStack {
                 Text(cue == nil ? "Select a cue to see its timeline and audio channels." : "No media information for this cue.")

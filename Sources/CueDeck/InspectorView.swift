@@ -109,7 +109,7 @@ struct CueInspector: View {
             } header: {
                 Text("Playback")
             } footer: {
-                Text("Speed keeps the pitch. Speed, volume and routing change instantly while the cue plays.")
+                Text("Speed keeps the pitch. Speed and volume change instantly while the cue plays.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
@@ -197,7 +197,9 @@ struct StreamRouteMenu: View {
             Text(compact ? "\(track.displayName) → \(currentLabel)" : currentLabel)
                 .lineLimit(1)
         }
-        .menuStyle(.borderlessButton)
+        .menuStyle(.button)
+        .buttonStyle(.bordered)
+        .controlSize(.small)
         .fixedSize()
         .help("Choose which outputs \(track.displayName) plays on")
     }

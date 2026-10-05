@@ -70,6 +70,11 @@ struct ContentView: View {
         // Hiding the inspector and the bottom panel allows a small window for the show.
         .frame(minWidth: hideInspector ? 600 : 1000, minHeight: hideBottom ? (engine.showMode ? 200 : 420) : 620)
         .background(WindowLevel(floating: keepInFront))
+        // The show file's name, and whether the list is kept in a file.
+        .navigationTitle(engine.showURL?.deletingPathExtension().lastPathComponent ?? "Untitled Show")
+        .navigationSubtitle(engine.showURL == nil
+                            ? "Not saved as a file yet (⌘S)"
+                            : "Changes are saved automatically")
         .onChange(of: engine.message) { msg in
             guard let msg else { return }
             let e = engine
@@ -447,6 +452,10 @@ struct CueListView: View {
                         }
                 }
                 .onMove { engine.moveCues(from: $0, to: $1) }
+                // Files dropped between cues are inserted there.
+                .onInsert(of: [UTType.fileURL]) { index, providers in
+                    loadURLs(providers) { engine.addFiles($0, at: index) }
+                }
             }
             .overlay {
                 if engine.cues.isEmpty {
@@ -462,13 +471,9 @@ struct CueListView: View {
                     RoundedRectangle(cornerRadius: 8).stroke(Color.accentColor, lineWidth: 3).padding(4)
                 }
             }
-            .onDrop(of: [UTType.fileURL], isTargeted: $dropTargeted) { providers in
-                for provider in providers {
-                    _ = provider.loadObject(ofClass: URL.self) { url, _ in
-                        guard let url else { return }
-                        Task { @MainActor in PlaybackEngine.shared.addFiles([url]) }
-                    }
-                }
+            // An empty list has no rows to drop between, so it takes drops as a whole.
+            .onDrop(of: engine.cues.isEmpty ? [UTType.fileURL] : [], isTargeted: $dropTargeted) { providers in
+                loadURLs(providers) { engine.addFiles($0) }
                 return true
             }
 
@@ -476,7 +481,23 @@ struct CueListView: View {
         }
     }
 
-    /// Add / remove and the panel toggles; hidden in show mode to save height.
+    /// Reads dropped file URLs, keeping their order.
+    private func loadURLs(_ providers: [NSItemProvider], then add: @escaping @MainActor ([URL]) -> Void) {
+        var urls = [URL?](repeating: nil, count: providers.count)
+        let group = DispatchGroup()
+        for (i, provider) in providers.enumerated() {
+            group.enter()
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                DispatchQueue.main.async { urls[i] = url; group.leave() }
+            }
+        }
+        group.notify(queue: .main) {
+            let found = urls.compactMap { $0 }
+            if !found.isEmpty { MainActor.assumeIsolated { add(found) } }
+        }
+    }
+
+    /// Add / delete and the panel toggles; hidden in show mode to save height.
     private var footer: some View {
         VStack(spacing: 0) {
             Divider()
@@ -484,10 +505,10 @@ struct CueListView: View {
                 Button { engine.addFilesWithPanel() } label: { Label("Add Media", systemImage: "plus") }
                     .help("Add video or audio files to the cue list (⌘I). You can also drop files here.")
                 Button { engine.removeSelected() } label: {
-                    Label(engine.selectedIDs.count > 1 ? "Remove \(engine.selectedIDs.count)" : "Remove", systemImage: "minus")
+                    Label(engine.selectedIDs.count > 1 ? "Delete \(engine.selectedIDs.count)" : "Delete", systemImage: "minus")
                 }
                 .disabled(engine.selectedIDs.isEmpty && engine.selection == nil)
-                .help("Delete the selected cues (⌫). Shift-click selects a range, ⌘-click adds cues.")
+                .help("Delete the selected cues (⌫, ⌘Z to undo). Shift-click selects a range, ⌘-click adds cues.")
                 Spacer()
                 Text("\(engine.cues.count) cues").foregroundStyle(.secondary).font(.caption)
                 panelToggles
@@ -517,6 +538,28 @@ struct CueRow: View {
     let cue: Cue
     let active: Bool
 
+    /// The cue GO plays next.
+    private var isNext: Bool { engine.selection == cue.id && engine.selectedIDs.count <= 1 }
+    private var nowPlaying: NowPlaying? { engine.playing.last { $0.cueID == cue.id } }
+
+    /// Remaining time while playing (green, orange when paused), else the length.
+    @ViewBuilder private var timeLabel: some View {
+        if let np = nowPlaying {
+            Text(cue.endAction == .loop ? "∞" : "−\(formatTime(np.remaining))")
+                .monospacedDigit()
+                .fontWeight(.semibold)
+                .foregroundStyle(np.paused ? Color.orange : Color.green)
+                .fixedSize()
+                .help(np.paused ? "Paused, time remaining" : "Playing, time remaining")
+        } else {
+            Text(cue.endAction == .loop ? "∞" : formatTime(cue.playDuration))
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .fixedSize()
+                .help("How long the cue plays")
+        }
+    }
+
     private var details: String {
         var parts: [String] = []
         if cue.hasVideo { parts.append(cue.videoSize.isEmpty ? "Video" : cue.videoSize) }
@@ -531,61 +574,83 @@ struct CueRow: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            Text("\(number)")
-                .font(.system(.body, design: .rounded).weight(.semibold))
-                .frame(width: 28, alignment: .trailing)
-                .foregroundStyle(.secondary)
+            HStack(spacing: 3) {
+                if isNext {
+                    Image(systemName: "arrowtriangle.right.fill")
+                        .font(.caption)
+                        .foregroundStyle(.green)
+                        .help("GO plays this cue next")
+                }
+                Text("\(number)")
+                    .font(.system(.body, design: .rounded).weight(.semibold))
+                    .foregroundStyle(isNext ? Color.green : Color.secondary)
+            }
+            .frame(width: 40, alignment: .trailing)
             Image(systemName: cue.playsVideo ? "film" : "waveform")
                 .frame(width: 18)
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: 4) {
+                // Line 1: name, and the time on the right.
                 HStack(spacing: 6) {
-                    Text(cue.name).lineLimit(1)
+                    Text(cue.name).lineLimit(1).truncationMode(.tail)
+                        .help(cue.name)
                     if cue.missing {
                         Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
                             .help("File not found: \(cue.url.path)")
                     }
+                    Spacer(minLength: 6)
+                    if active {
+                        Button { engine.stopCue(cue.id) } label: {
+                            Image(systemName: "stop.circle.fill").foregroundStyle(.red)
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Stop this cue")
+                    }
+                    timeLabel
                 }
                 if !details.isEmpty {
                     Text(details).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
-                if !cue.audioTracks.isEmpty {
-                    // One output dropdown per audio stream.
-                    FlowLayout(spacing: 10, lineSpacing: 2) {
-                        ForEach(cue.audioTracks) { track in
-                            StreamRouteMenu(cue: cue, track: track, compact: true)
-                                .font(.caption)
-                                .disabled(engine.showMode)
-                        }
+                // Line 2: all settings; wraps in a narrow list instead of overlapping.
+                FlowLayout(spacing: 8, lineSpacing: 4) {
+                    ForEach(cue.audioTracks) { track in
+                        StreamRouteMenu(cue: cue, track: track, compact: true)
+                            .font(.caption)
+                            .disabled(engine.showMode)
                     }
+                    if cue.hasVideo {
+                        Toggle("Audio only", isOn: Binding(
+                            get: { cue.audioOnly },
+                            set: { engine.setAudioOnly(cue.id, $0) }
+                        ))
+                        .toggleStyle(.checkbox)
+                        .font(.caption)
+                        .fixedSize()
+                        .disabled(engine.showMode)
+                        .help("Play only the audio of this file, without video output. Applies the next time the cue starts.")
+                    }
+                    AutoStartMenu(cue: cue, isFirst: number == 1)
+                        .disabled(engine.showMode)
                 }
             }
-            Spacer()
-            if cue.hasVideo {
-                Toggle("Audio only", isOn: Binding(
-                    get: { cue.audioOnly },
-                    set: { engine.setAudioOnly(cue.id, $0) }
-                ))
-                .toggleStyle(.checkbox)
-                .font(.caption)
-                .fixedSize()
-                .disabled(engine.showMode)
-                .help("Play only the audio of this file, without video output. Applies the next time the cue starts.")
-            }
-            AutoStartMenu(cue: cue, isFirst: number == 1)
-                .disabled(engine.showMode)
-            if active {
-                Button { engine.stopCue(cue.id) } label: {
-                    Image(systemName: "stop.circle.fill").foregroundStyle(.red)
-                }
-                .buttonStyle(.borderless)
-                .help("Stop this cue")
-            }
-            Text(cue.endAction == .loop ? "∞" : formatTime(cue.playDuration))
-                .monospacedDigit()
-                .foregroundStyle(.secondary)
-                .fixedSize()
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(.vertical, 3)
+        .background(alignment: .bottom) {
+            // Playing cues: tinted row with a progress line.
+            if let np = nowPlaying {
+                ZStack(alignment: .bottomLeading) {
+                    RoundedRectangle(cornerRadius: 5)
+                        .fill((np.paused ? Color.orange : Color.green).opacity(0.14))
+                    GeometryReader { g in
+                        Rectangle()
+                            .fill(np.paused ? Color.orange : Color.green)
+                            .frame(width: g.size.width * min(max(np.progress, 0), 1), height: 2)
+                            .frame(maxHeight: .infinity, alignment: .bottom)
+                    }
+                }
+                .padding(.horizontal, -6)
+            }
+        }
     }
 }
 
@@ -609,10 +674,11 @@ struct AutoStartMenu: View {
             Label(mode.shortLabel, systemImage: mode.systemImage)
                 .lineLimit(1)
         }
-        .menuStyle(.borderlessButton)
+        .menuStyle(.button)
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .tint(mode == .off ? nil : Color.accentColor)
         .fixedSize()
-        .font(.caption)
-        .foregroundStyle(mode == .off ? Color.secondary : Color.accentColor)
         .disabled(isFirst)
         .help(isFirst ? "The first cue always waits for GO"
                       : "Autostart: \(mode.label). Choose whether this cue starts by itself.")
