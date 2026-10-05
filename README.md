@@ -21,6 +21,17 @@ open build/CueDeck.app
 
 `./build.sh debug` builds a debug version. The first build takes a minute or two.
 
+## Installing on another Mac
+
+`./package.sh` builds a universal app (Apple Silicon and Intel, macOS 13 or
+newer) and packs it into `build/CueDeck-<version>.dmg`.
+
+1. Copy the DMG to the other Mac, open it and drag CueDeck into Applications.
+2. The app has no Developer ID signature, so macOS blocks the first launch.
+   Open it once, then go to System Settings › Privacy & Security and click
+   *Open Anyway* (on macOS 14 and older, right-click the app › Open also works).
+   After that it starts normally.
+
 ## Using it
 
 1. **Pick the outputs** in the bar at the bottom:

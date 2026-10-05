@@ -11,6 +11,9 @@ mixer, one small Objective-C helper. macOS 13+, Apple Silicon.
   It runs `swift build`, wraps the binary in an app bundle, builds the icon
   with `iconutil` from `Resources/AppIcon-1024.png`, ad-hoc signs and
   registers the app with Launch Services.
+- Installable build: `./package.sh` (universal app + DMG in `build/`). The
+  Intel slice is built separately into `.build-x86` and joined with `lipo`,
+  because `swift build --arch arm64 --arch x86_64` needs full Xcode.
 - Mixer unit tests (any OS with a C compiler): `make -C Tests/cmixer`.
   Also run them under ThreadSanitizer after changing `Sources/CMixer`.
 - Swift only compiles on macOS. If a build fails, the compiler's diagnostics
