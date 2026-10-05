@@ -80,7 +80,9 @@ struct CueInspector: View {
                     HStack {
                         Slider(value: $cue.volumeDB, in: -60...12)
                             .help("Volume of this cue, -60 dB (silent) to +12 dB")
-                        TextField("0", value: $cue.volumeDB, format: .number.precision(.fractionLength(0...1)))
+                        TextField("", value: $cue.volumeDB, format: .number.precision(.fractionLength(0...1)),
+                                  prompt: Text("0"))
+                            .labelsHidden()
                             .textFieldStyle(.roundedBorder)
                             .multilineTextAlignment(.trailing)
                             .frame(width: 64)
@@ -95,10 +97,6 @@ struct CueInspector: View {
                     .help("Seconds the cue fades out before it reaches its end")
                 SecondsRow(title: "Fade on stop", value: $cue.stopFade)
                     .help("Seconds the cue fades out when it is stopped, e.g. by Stop or by GO on another cue")
-                TimeRow(title: "Start point", value: $cue.inPoint, placeholder: "00:00.00")
-                    .help("Where in the file the cue starts. Type a time like 1:23.5, empty = beginning")
-                TimeRow(title: "End point", value: $cue.outPoint, placeholder: "end of file")
-                    .help("Where in the file the cue ends. Type a time like 2:10, empty = end of file")
                 if cue.hasVideo {
                     Toggle("Audio only (no video output)", isOn: $cue.audioOnly)
                         .help("Play only the audio of this file. Applies the next time the cue starts.")
@@ -119,51 +117,24 @@ struct CueInspector: View {
     }
 }
 
+/// Seconds with a slider (0 to 5 s, in 0.1 s steps) and a field for exact or longer values.
 struct SecondsRow: View {
     let title: String
     @Binding var value: Double
+    private let sliderMax = 5.0
 
     var body: some View {
         LabeledContent(title) {
-            HStack(spacing: 4) {
-                NumberField(value: $value, digits: 2, width: 70)
+            HStack {
+                Slider(value: Binding(
+                    get: { min(value, sliderMax) },
+                    set: { value = ($0 * 10).rounded() / 10 }
+                ), in: 0...sliderMax)
+                NumberField(value: $value, digits: 2, width: 64)
+                    .help("Type the time in seconds and press Return, also more than 5 s")
                 Text("s").foregroundStyle(.secondary)
-                Stepper("", value: $value, in: 0...36000, step: 0.5).labelsHidden()
             }
         }
-    }
-}
-
-/// A time in the file, typed as 1:23.5 or seconds. 0 shows the placeholder.
-struct TimeRow: View {
-    let title: String
-    @Binding var value: Double
-    let placeholder: String
-    @State private var text = ""
-    @FocusState private var focused: Bool
-
-    var body: some View {
-        LabeledContent(title) {
-            TextField(placeholder, text: $text)
-                .textFieldStyle(.roundedBorder)
-                .font(.system(.body, design: .monospaced))
-                .multilineTextAlignment(.trailing)
-                .frame(width: 120)
-                .focused($focused)
-                .onSubmit(commit)
-                .onAppear { text = value > 0 ? formatTimecode(value) : "" }
-                .onChange(of: value) { v in if !focused { text = v > 0 ? formatTimecode(v) : "" } }
-                .onChange(of: focused) { f in if !f { commit() } }
-        }
-    }
-
-    private func commit() {
-        if text.trimmingCharacters(in: .whitespaces).isEmpty {
-            value = 0
-        } else if let v = parseTimecode(text) {
-            value = v
-        }
-        text = value > 0 ? formatTimecode(value) : ""
     }
 }
 

@@ -169,72 +169,112 @@ struct TransportBar: View {
         return "\(i + 1). \(engine.cues[i].name)"
     }
 
+    /// Width of the bar; below `wideMinimum` it uses two rows.
+    @State private var barWidth: CGFloat = 1200
+    private let wideMinimum: CGFloat = 920
+
     var body: some View {
-        HStack(alignment: .center, spacing: 14) {
-            HStack(spacing: 8) {
-                Button { engine.go() } label: {
-                    VStack(spacing: 2) {
-                        Text("GO").font(.system(size: 26, weight: .heavy))
-                        Text("Space").font(.caption2).opacity(0.85)
+        Group {
+            if barWidth >= wideMinimum {
+                // One row: GO, next cue, playing cues, transport, switches.
+                HStack(alignment: .center, spacing: 14) {
+                    goButtons
+                    nextCue
+                        .frame(minWidth: 90, idealWidth: 180, maxWidth: 200, alignment: .leading)
+                    Divider().frame(height: 50)
+                    NowPlayingList()
+                        .frame(maxWidth: .infinity)
+                    ViewThatFits(in: .horizontal) {
+                        transportButtons.labelStyle(.titleAndIcon)
+                        transportButtons.labelStyle(.iconOnly)
                     }
-                    .frame(width: 92, height: 58)
+                    .controlSize(.large)
+                    windowToggles.labelStyle(.titleAndIcon).frame(width: 104)
                 }
-                .buttonStyle(GoButtonStyle(color: .green))
-                .help("Play the selected cue and fade out everything that is playing (Space)")
-
-                Button { engine.go(keepOthers: true) } label: {
-                    VStack(spacing: 2) {
-                        Text("GO + KEEP").font(.system(size: 13, weight: .heavy))
-                        Text("⇧ Space").font(.caption2).opacity(0.85)
+            } else {
+                // Narrow window: the playing cues get their own full-width row.
+                VStack(spacing: 8) {
+                    HStack(alignment: .center, spacing: 10) {
+                        goButtons
+                        nextCue
+                            .frame(minWidth: 60, maxWidth: .infinity, alignment: .leading)
+                        transportButtons.labelStyle(.iconOnly)
+                            .controlSize(.large)
+                        windowToggles.labelStyle(.iconOnly).fixedSize()
                     }
-                    .frame(width: 92, height: 58)
+                    NowPlayingList()
                 }
-                .buttonStyle(GoButtonStyle(color: .blue))
-                .help("Play the selected cue and keep everything else playing (⇧ Space)")
             }
-            .disabled(engine.cues.isEmpty)
-            .fixedSize()
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Next").font(.caption).foregroundStyle(.secondary)
-                Text(nextName).font(.headline).lineLimit(1).truncationMode(.tail)
-            }
-            .frame(minWidth: 90, idealWidth: 180, maxWidth: 200, alignment: .leading)
-
-            Divider().frame(height: 50)
-
-            NowPlayingList()
-                .frame(maxWidth: .infinity)
-
-            ViewThatFits(in: .horizontal) {
-                transportButtons.labelStyle(.titleAndIcon)
-                transportButtons.labelStyle(.iconOnly)
-            }
-            .controlSize(.large)
         }
         .padding(.horizontal, 14).padding(.vertical, 10)
+        .frame(maxWidth: .infinity)
+        .background(GeometryReader { g in
+            Color.clear
+                .onAppear { barWidth = g.size.width }
+                .onChange(of: g.size.width) { barWidth = $0 }
+        })
     }
 
-    private var transportButtons: some View {
+    private var goButtons: some View {
         HStack(spacing: 8) {
-            Button { engine.showMode.toggle() } label: {
-                Label("Show Mode", systemImage: engine.showMode ? "lock.fill" : "lock.open")
+            Button { engine.go() } label: {
+                VStack(spacing: 2) {
+                    Text("GO").font(.system(size: 26, weight: .heavy))
+                    Text("Space").font(.caption2).opacity(0.85)
+                }
+                .frame(width: 92, height: 58)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(engine.showMode ? .orange : .gray)
+            .buttonStyle(GoButtonStyle(color: .green))
+            .help("Play the selected cue and fade out everything that is playing (Space)")
+
+            Button { engine.go(keepOthers: true) } label: {
+                VStack(spacing: 2) {
+                    Text("GO + KEEP").font(.system(size: 13, weight: .heavy))
+                    Text("⇧ Space").font(.caption2).opacity(0.85)
+                }
+                .frame(width: 92, height: 58)
+            }
+            .buttonStyle(GoButtonStyle(color: .blue))
+            .help("Play the selected cue and keep everything else playing (⇧ Space)")
+        }
+        .disabled(engine.cues.isEmpty)
+        .fixedSize()
+    }
+
+    private var nextCue: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Next").font(.caption).foregroundStyle(.secondary)
+            Text(nextName).font(.headline).lineLimit(1).truncationMode(.tail)
+                .help(nextName)
+        }
+    }
+
+    /// Show mode and On Top: two small switches stacked, so they take little width.
+    private var windowToggles: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Toggle(isOn: $engine.showMode) {
+                Label("Show Mode", systemImage: engine.showMode ? "lock.fill" : "lock.open")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .tint(.orange)
             .help(engine.showMode
                   ? "Show mode is on: minimal window, editing locked. Click to edit again (⌥⌘L)."
                   : "Show mode: minimal window for the show, locks editing (⌥⌘L)")
 
-            Button { keepInFront.toggle() } label: {
+            Toggle(isOn: $keepInFront) {
                 Label("On Top", systemImage: keepInFront ? "pin.fill" : "pin")
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(keepInFront ? .accentColor : .gray)
             .help(keepInFront
                   ? "CueDeck stays in front of other windows. Click to turn off."
                   : "Keep CueDeck in front of other windows")
+        }
+        .toggleStyle(.button)
+        .controlSize(.small)
+    }
 
+    private var transportButtons: some View {
+        HStack(spacing: 8) {
             Button {
                 engine.togglePause()
             } label: {
@@ -307,45 +347,63 @@ struct NowPlayingRow: View {
                 Image(systemName: np.paused ? "pause.circle.fill" : (np.stopping ? "speaker.wave.1.fill" : "play.circle.fill"))
                     .foregroundStyle(np.paused ? Color.orange : Color.green)
                 Text(np.name).font(.headline).lineLimit(1).truncationMode(.tail)
-                    .layoutPriority(-1)
+                    .frame(minWidth: 60, maxWidth: 220, alignment: .leading)
+                    .layoutPriority(1)
+                    .help(np.name)
                 Spacer(minLength: 6)
 
-                // Live speed
-                HStack(spacing: 2) {
-                    Button { engine.changeSpeed(np.cueID, to: max(0.25, np.speed - 0.05)) } label: { Image(systemName: "minus") }
-                        .help("Slower by 0.05× (pitch stays the same)")
-                    Text(String(format: "%.2f×", np.speed)).monospacedDigit().frame(width: 48)
-                        .help("Current speed")
-                    Button { engine.changeSpeed(np.cueID, to: min(4, np.speed + 0.05)) } label: { Image(systemName: "plus") }
-                        .help("Faster by 0.05× (pitch stays the same)")
-                    if np.speed != 1 {
-                        Button("1×") { engine.changeSpeed(np.cueID, to: 1) }
-                            .help("Back to normal speed")
+                // Drops the speed controls, then the elapsed time, when space runs out.
+                // The remaining time is always shown on one line.
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 10) { speedControls; times(elapsed: true) }
+                    HStack(spacing: 10) { speedControls; times(elapsed: false) }
+                    times(elapsed: false)
+                }
+
+                HStack(spacing: 8) {
+                    Button { engine.togglePause(np.cueID) } label: {
+                        Image(systemName: np.paused ? "play.fill" : "pause.fill")
                     }
+                    .help(np.paused ? "Resume this cue" : "Pause this cue")
+                    Button { engine.stopCue(np.cueID) } label: { Image(systemName: "stop.fill") }
+                        .help("Stop this cue")
                 }
                 .buttonStyle(.borderless)
                 .fixedSize()
-
-                ViewThatFits(in: .horizontal) {
-                    HStack(spacing: 8) {
-                        Text(formatTime(np.elapsed)).monospacedDigit().foregroundStyle(.secondary)
-                        Text("−\(formatTime(np.remaining))").monospacedDigit().font(.body.weight(.semibold))
-                    }
-                    Text("−\(formatTime(np.remaining))").monospacedDigit().font(.body.weight(.semibold))
-                }
-
-                Button { engine.togglePause(np.cueID) } label: {
-                    Image(systemName: np.paused ? "play.fill" : "pause.fill")
-                }
-                .buttonStyle(.borderless)
-                .help(np.paused ? "Resume this cue" : "Pause this cue")
-                Button { engine.stopCue(np.cueID) } label: { Image(systemName: "stop.fill") }
-                    .buttonStyle(.borderless)
-                    .help("Stop this cue")
             }
             ProgressView(value: min(max(np.progress, 0), 1))
                 .controlSize(.small)
         }
+    }
+
+    private var speedControls: some View {
+        HStack(spacing: 2) {
+            Button { engine.changeSpeed(np.cueID, to: max(0.25, np.speed - 0.05)) } label: { Image(systemName: "minus") }
+                .help("Slower by 0.05× (pitch stays the same)")
+            Text(String(format: "%.2f×", np.speed)).monospacedDigit().frame(width: 48)
+                .help("Current speed")
+            Button { engine.changeSpeed(np.cueID, to: min(4, np.speed + 0.05)) } label: { Image(systemName: "plus") }
+                .help("Faster by 0.05× (pitch stays the same)")
+            if np.speed != 1 {
+                Button("1×") { engine.changeSpeed(np.cueID, to: 1) }
+                    .help("Back to normal speed")
+            }
+        }
+        .buttonStyle(.borderless)
+        .fixedSize()
+    }
+
+    private func times(elapsed: Bool) -> some View {
+        HStack(spacing: 8) {
+            if elapsed {
+                Text(formatTime(np.elapsed)).monospacedDigit().foregroundStyle(.secondary)
+                    .help("Time played")
+            }
+            Text("−\(formatTime(np.remaining))").monospacedDigit().font(.body.weight(.semibold))
+                .help("Time remaining")
+        }
+        .lineLimit(1)
+        .fixedSize()
     }
 }
 
