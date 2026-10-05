@@ -59,6 +59,8 @@ open build/CueDeck.app
 | --- | --- |
 | Space | GO: play the selected cue (fades out what is playing), select the next one |
 | ⇧ Space | GO + KEEP: play the selected cue and keep everything else playing |
+| ⌥⌘L | Show mode: minimal window, editing locked |
+| ⌥⌘I / ⌥⌘B | Hide or show the inspector / the timeline and waveforms |
 | P | Pause / resume |
 | ← / → | One frame back / forward |
 | I / O | Start / end point at the playhead |

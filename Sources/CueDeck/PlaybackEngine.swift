@@ -57,6 +57,11 @@ final class PlaybackEngine: NSObject, ObservableObject {
             output?.setMasterGain(Self.gain(masterDB))
         }
     }
+    /// Show mode: minimal window for running the show. Cues can't be deleted,
+    /// moved or trimmed by accident.
+    @Published var showMode = false {
+        didSet { UserDefaults.standard.set(showMode, forKey: Keys.showMode) }
+    }
     /// Default routing for new cues, per stream: first output (0 based) or a
     /// `RoutingDefault` value. Set in Settings.
     @Published var defaultRouting: [Int] = [] {
@@ -91,6 +96,7 @@ final class PlaybackEngine: NSObject, ObservableObject {
         static let screenName = "videoDisplayName"
         static let master = "masterDB"
         static let defaultRouting = "defaultRouting"
+        static let showMode = "showMode"
         static func outputNames(_ uid: String) -> String { "outputNames.\(uid)" }
     }
 
@@ -107,6 +113,7 @@ final class PlaybackEngine: NSObject, ObservableObject {
         let d = UserDefaults.standard
         masterDB = d.object(forKey: Keys.master) as? Double ?? 0
         defaultRouting = d.array(forKey: Keys.defaultRouting) as? [Int] ?? []
+        showMode = d.bool(forKey: Keys.showMode)
 
         refreshScreens()
         let savedScreen = CGDirectDisplayID(d.integer(forKey: Keys.screen))
@@ -353,7 +360,7 @@ final class PlaybackEngine: NSObject, ObservableObject {
 
     /// Deletes cues from the list; playing ones stop immediately.
     func removeCues(_ ids: Set<UUID>) {
-        guard !ids.isEmpty else { return }
+        guard !showMode, !ids.isEmpty else { return }
         let lastIndex = cues.lastIndex { ids.contains($0.id) } ?? 0
         let removedBefore = cues[..<min(lastIndex + 1, cues.count)].filter { ids.contains($0.id) }.count
         for s in sessions where ids.contains(s.cue.id) { s.stop(fade: 0) }
@@ -365,6 +372,7 @@ final class PlaybackEngine: NSObject, ObservableObject {
     }
 
     func moveCues(from: IndexSet, to: Int) {
+        guard !showMode else { return }
         cues.move(fromOffsets: from, toOffset: to)
     }
 
@@ -394,13 +402,13 @@ final class PlaybackEngine: NSObject, ObservableObject {
 
     /// Routes a whole audio track (stream) to consecutive outputs, -1 = off.
     func setTrackBlock(cueID: UUID, track: Int, start: Int) {
-        guard var cue = findCue(cueID) else { return }
+        guard !showMode, var cue = findCue(cueID) else { return }
         cue.setBlock(track: track, start: start, outputChannels: routingChannels)
         updateCue(cue)
     }
 
     func setAutoStart(_ id: UUID, _ mode: AutoStart) {
-        guard var cue = findCue(id) else { return }
+        guard !showMode, var cue = findCue(id) else { return }
         cue.autoStart = mode
         updateCue(cue)
     }
@@ -587,7 +595,7 @@ final class PlaybackEngine: NSObject, ObservableObject {
 
     /// Sets the start point (file seconds). Applies the next time the cue starts.
     func setStartPoint(_ id: UUID, to seconds: Double) {
-        guard var cue = findCue(id) else { return }
+        guard !showMode, var cue = findCue(id) else { return }
         let end = cue.segmentEnd
         cue.inPoint = min(max(0, cue.frameStart(seconds)), max(0, end - 0.1))
         updateCue(cue)
@@ -596,7 +604,7 @@ final class PlaybackEngine: NSObject, ObservableObject {
 
     /// Sets the end point (file seconds); at or past the file's end clears it.
     func setEndPoint(_ id: UUID, to seconds: Double) {
-        guard var cue = findCue(id) else { return }
+        guard !showMode, var cue = findCue(id) else { return }
         let t = cue.frameStart(seconds)
         if t >= cue.duration - 0.01 {
             cue.outPoint = 0
@@ -608,7 +616,7 @@ final class PlaybackEngine: NSObject, ObservableObject {
     }
 
     func clearStartEnd(_ id: UUID) {
-        guard var cue = findCue(id) else { return }
+        guard !showMode, var cue = findCue(id) else { return }
         cue.inPoint = 0
         cue.outPoint = 0
         updateCue(cue)
@@ -624,7 +632,7 @@ final class PlaybackEngine: NSObject, ObservableObject {
     }
 
     func addMarker(_ id: UUID) {
-        guard var cue = findCue(id) else { return }
+        guard !showMode, var cue = findCue(id) else { return }
         let t = cue.frameStart(livePlayhead(id))
         cue.markers.append(Marker(name: "Marker \(cue.markers.count + 1)", time: t))
         cue.markers.sort { $0.time < $1.time }

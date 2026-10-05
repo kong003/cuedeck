@@ -6,6 +6,13 @@ struct ContentView: View {
     @EnvironmentObject var engine: PlaybackEngine
     @AppStorage("cueListWidth") private var cueListWidth = 480.0
     @AppStorage("bottomPanelHeight") private var bottomHeight = 220.0
+    @AppStorage(LayoutKeys.inspectorHidden) private var inspectorHidden = false
+    @AppStorage(LayoutKeys.bottomHidden) private var bottomHidden = false
+    @AppStorage(LayoutKeys.keepInFront) private var keepInFront = false
+
+    // Show mode always shows the minimal window.
+    private var hideInspector: Bool { inspectorHidden || engine.showMode }
+    private var hideBottom: Bool { bottomHidden || engine.showMode }
 
     private func clamp(_ v: Double, _ lo: Double, _ hi: Double) -> Double {
         min(max(v, lo), max(lo, hi))
@@ -36,21 +43,33 @@ struct ContentView: View {
                 let bottom = clamp(bottomHeight, 110, geo.size.height - 220)
                 VStack(spacing: 0) {
                     HStack(spacing: 0) {
-                        CueListView()
-                            .frame(width: listWidth)
-                        SplitHandle(vertical: true, value: $cueListWidth, current: listWidth)
-                        InspectorPane()
-                            .frame(maxWidth: .infinity)
+                        if hideInspector {
+                            CueListView()
+                                .frame(maxWidth: .infinity)
+                        } else {
+                            CueListView()
+                                .frame(width: listWidth)
+                            SplitHandle(vertical: true, value: $cueListWidth, current: listWidth)
+                            InspectorPane()
+                                .frame(maxWidth: .infinity)
+                        }
                     }
                     .frame(maxHeight: .infinity)
-                    SplitHandle(vertical: false, value: $bottomHeight, current: bottom, inverted: true)
-                    WaveformPanel()
-                        .frame(height: bottom)
+                    if !hideBottom {
+                        SplitHandle(vertical: false, value: $bottomHeight, current: bottom, inverted: true)
+                        WaveformPanel()
+                            .frame(height: bottom)
+                    }
                 }
             }
-            Divider()
-            OutputBar()
+            if !engine.showMode {
+                Divider()
+                OutputBar()
+            }
         }
+        // Hiding the inspector and the bottom panel allows a small window for the show.
+        .frame(minWidth: hideInspector ? 600 : 1000, minHeight: hideBottom ? (engine.showMode ? 200 : 420) : 620)
+        .background(WindowLevel(floating: keepInFront))
         .onChange(of: engine.message) { msg in
             guard let msg else { return }
             let e = engine
@@ -59,6 +78,23 @@ struct ContentView: View {
                 if e.message == msg { e.message = nil }
             }
         }
+    }
+}
+
+/// UserDefaults keys of the collapsible panels, shared by the window and the View menu.
+enum LayoutKeys {
+    static let inspectorHidden = "inspectorHidden"
+    static let bottomHidden = "bottomPanelHidden"
+    static let keepInFront = "keepWindowInFront"
+}
+
+/// Keeps the window above other apps' windows while `floating` is on.
+struct WindowLevel: NSViewRepresentable {
+    let floating: Bool
+    func makeNSView(context: Context) -> NSView { NSView() }
+    func updateNSView(_ view: NSView, context: Context) {
+        let level: NSWindow.Level = floating ? .floating : .normal
+        DispatchQueue.main.async { view.window?.level = level }
     }
 }
 
@@ -179,6 +215,15 @@ struct TransportBar: View {
 
     private var transportButtons: some View {
         HStack(spacing: 8) {
+            Button { engine.showMode.toggle() } label: {
+                Label("Show Mode", systemImage: engine.showMode ? "lock.fill" : "lock.open")
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(engine.showMode ? .orange : .gray)
+            .help(engine.showMode
+                  ? "Show mode is on: minimal window, editing locked. Click to edit again (⌥⌘L)."
+                  : "Show mode: minimal window for the show, locks editing (⌥⌘L)")
+
             Button {
                 engine.togglePause()
             } label: {
@@ -295,6 +340,8 @@ struct NowPlayingRow: View {
 struct CueListView: View {
     @EnvironmentObject var engine: PlaybackEngine
     @State private var dropTargeted = false
+    @AppStorage(LayoutKeys.inspectorHidden) private var inspectorHidden = false
+    @AppStorage(LayoutKeys.bottomHidden) private var bottomHidden = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -311,7 +358,9 @@ struct CueListView: View {
                             Button("Reload Media Info") { engine.reinspect(cue.id) }
                             Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([cue.url]) }
                             Divider()
-                            if engine.selectedIDs.count > 1 && engine.selectedIDs.contains(cue.id) {
+                            if engine.showMode {
+                                // No deleting during the show.
+                            } else if engine.selectedIDs.count > 1 && engine.selectedIDs.contains(cue.id) {
                                 Button("Delete \(engine.selectedIDs.count) Cues", role: .destructive) {
                                     engine.removeSelected()
                                 }
@@ -348,6 +397,13 @@ struct CueListView: View {
                 return true
             }
 
+            if !engine.showMode { footer }
+        }
+    }
+
+    /// Add / remove and the panel toggles; hidden in show mode to save height.
+    private var footer: some View {
+        VStack(spacing: 0) {
             Divider()
             HStack {
                 Button { engine.addFilesWithPanel() } label: { Label("Add Media", systemImage: "plus") }
@@ -358,9 +414,23 @@ struct CueListView: View {
                 .help("Delete the selected cues (⌫). Shift-click selects a range, ⌘-click adds cues.")
                 Spacer()
                 Text("\(engine.cues.count) cues").foregroundStyle(.secondary).font(.caption)
+                panelToggles
             }
             .buttonStyle(.borderless)
             .padding(8)
+        }
+    }
+
+    private var panelToggles: some View {
+        Group {
+            Button { bottomHidden.toggle() } label: {
+                Image(systemName: bottomHidden ? "rectangle.bottomthird.inset.filled" : "rectangle.split.1x2")
+            }
+            .help(bottomHidden ? "Show the timeline and waveforms (⌥⌘B)" : "Hide the timeline and waveforms (⌥⌘B)")
+            Button { inspectorHidden.toggle() } label: {
+                Image(systemName: inspectorHidden ? "sidebar.right" : "rectangle.split.2x1")
+            }
+            .help(inspectorHidden ? "Show the inspector (⌥⌘I)" : "Hide the inspector (⌥⌘I)")
         }
     }
 }
@@ -409,12 +479,14 @@ struct CueRow: View {
                         ForEach(cue.audioTracks) { track in
                             StreamRouteMenu(cue: cue, track: track, compact: true)
                                 .font(.caption)
+                                .disabled(engine.showMode)
                         }
                     }
                 }
             }
             Spacer()
             AutoStartMenu(cue: cue, isFirst: number == 1)
+                .disabled(engine.showMode)
             if active {
                 Button { engine.stopCue(cue.id) } label: {
                     Image(systemName: "stop.circle.fill").foregroundStyle(.red)

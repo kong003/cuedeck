@@ -5,12 +5,14 @@ import SwiftUI
 struct CueDeckApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @ObservedObject private var engine = PlaybackEngine.shared
+    @AppStorage(LayoutKeys.inspectorHidden) private var inspectorHidden = false
+    @AppStorage(LayoutKeys.bottomHidden) private var bottomHidden = false
+    @AppStorage(LayoutKeys.keepInFront) private var keepInFront = false
 
     var body: some Scene {
         Window("CueDeck", id: "main") {
             ContentView()
                 .environmentObject(engine)
-                .frame(minWidth: 1000, minHeight: 620)
         }
         Settings {
             SettingsView()
@@ -31,6 +33,19 @@ struct CueDeckApp: App {
                     .keyboardShortcut("s")
                 Button("Save Show As…") { engine.saveShowAs() }
                     .keyboardShortcut("s", modifiers: [.command, .shift])
+            }
+            CommandGroup(after: .toolbar) {
+                Button(engine.showMode ? "Leave Show Mode" : "Enter Show Mode") { engine.showMode.toggle() }
+                    .keyboardShortcut("l", modifiers: [.command, .option])
+                Divider()
+                Button(inspectorHidden ? "Show Inspector" : "Hide Inspector") { inspectorHidden.toggle() }
+                    .keyboardShortcut("i", modifiers: [.command, .option])
+                    .disabled(engine.showMode)
+                Button(bottomHidden ? "Show Timeline and Waveforms" : "Hide Timeline and Waveforms") { bottomHidden.toggle() }
+                    .keyboardShortcut("b", modifiers: [.command, .option])
+                    .disabled(engine.showMode)
+                Toggle("Keep Window in Front", isOn: $keepInFront)
+                Divider()
             }
             CommandMenu("Playback") {
                 // Space, P and Esc are handled by AppDelegate so they never
