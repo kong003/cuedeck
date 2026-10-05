@@ -190,9 +190,10 @@ struct WaveformPanel: View {
                             }
                         }
                     }
-                    .frame(maxHeight: laneAreaHeight(cue))
+                    .frame(maxHeight: .infinity)
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .padding(.horizontal, 14).padding(.vertical, 8)
             .task(id: WaveformStore.key(for: cue)) { store.load(cue) }
         } else {
@@ -202,17 +203,13 @@ struct WaveformPanel: View {
                 Spacer()
             }
             .padding(.horizontal, 14).padding(.vertical, 10)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
     }
 
     private func peaks(_ cue: Cue, _ t: Int, _ c: Int) -> [Float]? {
         guard let w = store.waveform(for: cue), t < w.peaks.count, c < w.peaks[t].count else { return nil }
         return w.peaks[t][c]
-    }
-
-    private func laneAreaHeight(_ cue: Cue) -> CGFloat {
-        let lanes = cue.audioTracks.reduce(0) { $0 + $1.channels }
-        return min(CGFloat(lanes) * 36, 180)
     }
 }
 

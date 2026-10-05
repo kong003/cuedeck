@@ -3,8 +3,11 @@ import Foundation
 /// What happens when a cue reaches its end.
 enum EndAction: String, Codable, CaseIterable, Identifiable {
     case stop      // stop and close the video output
-    case next      // start the next cue in the list
+    case next      // older shows only: becomes AutoStart.afterPrevious on the next cue
     case loop      // repeat seamlessly until stopped
+
+    /// The choices offered in the inspector.
+    static let selectable: [EndAction] = [.stop, .loop]
 
     var id: String { rawValue }
     var label: String {
@@ -12,6 +15,36 @@ enum EndAction: String, Codable, CaseIterable, Identifiable {
         case .stop: return "Stop"
         case .next: return "Play next cue"
         case .loop: return "Loop"
+        }
+    }
+}
+
+/// Whether a cue starts by itself, relative to the cue above it in the list.
+enum AutoStart: String, Codable, CaseIterable, Identifiable {
+    case off            // waits for GO
+    case afterPrevious  // starts exactly when the previous cue ends
+    case withPrevious   // starts together with the previous cue
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .off: return "No autostart"
+        case .afterPrevious: return "At end of previous cue"
+        case .withPrevious: return "Together with previous cue"
+        }
+    }
+    var shortLabel: String {
+        switch self {
+        case .off: return "Manual"
+        case .afterPrevious: return "After previous"
+        case .withPrevious: return "With previous"
+        }
+    }
+    var systemImage: String {
+        switch self {
+        case .off: return "hand.point.up.left"
+        case .afterPrevious: return "arrow.turn.down.right"
+        case .withPrevious: return "link"
         }
     }
 }
@@ -58,6 +91,15 @@ struct AudioTrackInfo: Codable, Equatable, Identifiable {
     }
 }
 
+/// Special values in the default routing (Settings). Other values are the
+/// first output of the stream, 0 based.
+enum RoutingDefault {
+    static let automatic = -2   // right after the previous stream
+    static let off = -1
+    /// Streams listed in the settings (a cue plays up to 16 audio tracks).
+    static let streams = 16
+}
+
 /// A named position in a cue, in seconds of the source file.
 struct Marker: Codable, Equatable, Identifiable {
     var id = UUID()
@@ -80,6 +122,7 @@ struct Cue: Identifiable, Codable, Equatable {
     var inPoint: Double = 0            // seconds into the source file
     var outPoint: Double = 0           // seconds into the source file, 0 = until the end
     var endAction: EndAction = .stop
+    var autoStart: AutoStart = .off
     /// Start without stopping cues that are already playing.
     var playAlongside: Bool = false
 
@@ -144,22 +187,26 @@ struct Cue: Identifiable, Codable, Equatable {
 
     // MARK: Routing
 
-    /// Track 1 -> outputs 1-2, track 2 -> outputs 3-4, ... (0 based).
-    mutating func assignDefaultRoutes(outputChannels: Int) {
+    /// Routes every track by the default routing from the settings:
+    /// `defaults[track]` is the first output (0 based), `RoutingDefault.off`, or
+    /// `RoutingDefault.automatic` (right after the previous track; the default,
+    /// so track 1 -> outputs 1-2, track 2 -> outputs 3-4, ...).
+    mutating func assignDefaultRoutes(outputChannels: Int, defaults: [Int] = []) {
         var next = 0
-        routes = audioTracks.map { track in
-            (0..<track.channels).map { _ in
-                defer { next += 1 }
-                return next < outputChannels ? next : -1
-            }
+        routes = audioTracks.enumerated().map { t, track in
+            let setting = t < defaults.count ? defaults[t] : RoutingDefault.automatic
+            if setting == RoutingDefault.off { return Array(repeating: -1, count: track.channels) }
+            let start = setting >= 0 ? setting : next
+            next = start + track.channels
+            return (0..<track.channels).map { c in start + c < outputChannels ? start + c : -1 }
         }
     }
 
     /// Makes sure routes has one entry per track channel.
-    mutating func normalizeRoutes(outputChannels: Int) {
+    mutating func normalizeRoutes(outputChannels: Int, defaults: [Int] = []) {
         let shapeOK = routes.count == audioTracks.count &&
             zip(routes, audioTracks).allSatisfy { $0.count == $1.channels }
-        if !shapeOK { assignDefaultRoutes(outputChannels: outputChannels) }
+        if !shapeOK { assignDefaultRoutes(outputChannels: outputChannels, defaults: defaults) }
     }
 
     /// First output of a track if its channels go to consecutive outputs,
@@ -210,7 +257,7 @@ struct Cue: Identifiable, Codable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case id, url, name, speed, volumeDB, fadeIn, fadeOut, stopFade, inPoint, outPoint,
-             endAction, playAlongside, routes, markers, duration, hasVideo, videoSize, frameRate, audioTracks
+             endAction, autoStart, playAlongside, routes, markers, duration, hasVideo, videoSize, frameRate, audioTracks
     }
 
     init(from decoder: Decoder) throws {
@@ -226,6 +273,7 @@ struct Cue: Identifiable, Codable, Equatable {
         inPoint = try c.decodeIfPresent(Double.self, forKey: .inPoint) ?? 0
         outPoint = try c.decodeIfPresent(Double.self, forKey: .outPoint) ?? 0
         endAction = try c.decodeIfPresent(EndAction.self, forKey: .endAction) ?? .stop
+        autoStart = try c.decodeIfPresent(AutoStart.self, forKey: .autoStart) ?? .off
         playAlongside = try c.decodeIfPresent(Bool.self, forKey: .playAlongside) ?? false
         routes = try c.decodeIfPresent([[Int]].self, forKey: .routes) ?? []
         markers = try c.decodeIfPresent([Marker].self, forKey: .markers) ?? []
@@ -249,6 +297,7 @@ struct Cue: Identifiable, Codable, Equatable {
         try c.encode(inPoint, forKey: .inPoint)
         try c.encode(outPoint, forKey: .outPoint)
         try c.encode(endAction, forKey: .endAction)
+        try c.encode(autoStart, forKey: .autoStart)
         try c.encode(playAlongside, forKey: .playAlongside)
         try c.encode(routes, forKey: .routes)
         try c.encode(markers, forKey: .markers)

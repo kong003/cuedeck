@@ -57,6 +57,11 @@ final class PlaybackEngine: NSObject, ObservableObject {
             output?.setMasterGain(Self.gain(masterDB))
         }
     }
+    /// Default routing for new cues, per stream: first output (0 based) or a
+    /// `RoutingDefault` value. Set in Settings.
+    @Published var defaultRouting: [Int] = [] {
+        didSet { UserDefaults.standard.set(defaultRouting, forKey: Keys.defaultRouting) }
+    }
     /// Custom names of the output channels of the current device ("" = default).
     @Published private(set) var outputNames: [String] = []
 
@@ -85,6 +90,7 @@ final class PlaybackEngine: NSObject, ObservableObject {
         static let screen = "videoDisplayID"
         static let screenName = "videoDisplayName"
         static let master = "masterDB"
+        static let defaultRouting = "defaultRouting"
         static func outputNames(_ uid: String) -> String { "outputNames.\(uid)" }
     }
 
@@ -100,6 +106,7 @@ final class PlaybackEngine: NSObject, ObservableObject {
         super.init()
         let d = UserDefaults.standard
         masterDB = d.object(forKey: Keys.master) as? Double ?? 0
+        defaultRouting = d.array(forKey: Keys.defaultRouting) as? [Int] ?? []
 
         refreshScreens()
         let savedScreen = CGDirectDisplayID(d.integer(forKey: Keys.screen))
@@ -295,7 +302,7 @@ final class PlaybackEngine: NSObject, ObservableObject {
                 return nil
             }
         }
-        cue.normalizeRoutes(outputChannels: routingChannels)
+        cue.normalizeRoutes(outputChannels: routingChannels, defaults: defaultRouting)
         cues.append(cue)
         if selection == nil { selection = cue.id }
         return cue.id
@@ -363,14 +370,38 @@ final class PlaybackEngine: NSObject, ObservableObject {
 
     func resetRoutes(for id: UUID) {
         guard var cue = findCue(id) else { return }
-        cue.assignDefaultRoutes(outputChannels: routingChannels)
+        cue.assignDefaultRoutes(outputChannels: routingChannels, defaults: defaultRouting)
         updateCue(cue)
+    }
+
+    /// Default routing of one stream (Settings).
+    func defaultRouting(forStream t: Int) -> Int {
+        t < defaultRouting.count ? defaultRouting[t] : RoutingDefault.automatic
+    }
+
+    func setDefaultRouting(forStream t: Int, to value: Int) {
+        var list = defaultRouting
+        while list.count <= t { list.append(RoutingDefault.automatic) }
+        list[t] = value
+        while list.last == RoutingDefault.automatic { list.removeLast() }
+        defaultRouting = list
+    }
+
+    /// Replaces the routing of every cue with the default routing.
+    func applyDefaultRoutingToAllCues() {
+        for cue in cues { resetRoutes(for: cue.id) }
     }
 
     /// Routes a whole audio track (stream) to consecutive outputs, -1 = off.
     func setTrackBlock(cueID: UUID, track: Int, start: Int) {
         guard var cue = findCue(cueID) else { return }
         cue.setBlock(track: track, start: start, outputChannels: routingChannels)
+        updateCue(cue)
+    }
+
+    func setAutoStart(_ id: UUID, _ mode: AutoStart) {
+        guard var cue = findCue(id) else { return }
+        cue.autoStart = mode
         updateCue(cue)
     }
 
@@ -381,7 +412,7 @@ final class PlaybackEngine: NSObject, ObservableObject {
             do {
                 try await MediaInspector.inspect(&cue)
                 cue.adoptNames(from: original.audioTracks)
-                cue.normalizeRoutes(outputChannels: routingChannels)
+                cue.normalizeRoutes(outputChannels: routingChannels, defaults: defaultRouting)
             } catch {
                 message = error.localizedDescription
             }
@@ -391,19 +422,32 @@ final class PlaybackEngine: NSObject, ObservableObject {
 
     // MARK: - Transport
 
-    /// Plays the selected cue and moves the selection to the next cue.
+    /// Plays the selected cue (and the cues set to start with it) and selects
+    /// the next cue that waits for GO.
     /// GO fades out whatever is playing; GO + KEEP (`keepOthers`) leaves it running.
     func go(keepOthers: Bool = false) {
         guard !cues.isEmpty else { return }
         let index = selectedIndex ?? 0
-        start(cues[index], at: nil, stopOthers: !keepOthers)
-        if index + 1 < cues.count { selection = cues[index + 1].id }
+        start(group(from: index), at: nil, stopOthers: !keepOthers)
+        if let next = nextManualIndex(after: index) { selection = cues[next].id }
     }
 
     /// Plays a cue now. `keepOthers` leaves the other cues playing.
     func play(_ id: UUID, keepOthers: Bool = false) {
-        guard let c = findCue(id) else { return }
-        start(c, at: nil, stopOthers: !keepOthers)
+        guard let i = cues.firstIndex(where: { $0.id == id }) else { return }
+        start(group(from: i), at: nil, stopOthers: !keepOthers)
+    }
+
+    /// The cue at `index` plus the cues below it set to start together with it.
+    private func group(from index: Int) -> [Cue] {
+        var end = index + 1
+        while end < cues.count && cues[end].autoStart == .withPrevious { end += 1 }
+        return Array(cues[index..<end])
+    }
+
+    /// The first cue after `index` that waits for GO (cues that start by themselves are skipped).
+    private func nextManualIndex(after index: Int) -> Int? {
+        cues.indices.first { $0 > index && cues[$0].autoStart == .off }
     }
 
     func stopCue(_ id: UUID) {
@@ -419,36 +463,43 @@ final class PlaybackEngine: NSObject, ObservableObject {
         }
     }
 
-    private func start(_ cue: Cue, at hostTime: UInt64?, stopOthers: Bool) {
-        if cue.missing || !FileManager.default.fileExists(atPath: cue.url.path) {
-            message = "File not found: \(cue.url.path)"
-            return
-        }
-        if output == nil && !cue.audioTracks.isEmpty {
-            message = "No audio output: \(outputStatus). \(cue.name) plays without sound."
-        }
-        let startMedia = pendingStarts[cue.id].map { cue.mediaTime(forFile: min(cue.seekTarget($0), cue.segmentEnd)) } ?? 0
-        pendingStarts[cue.id] = nil
-        let previous = sessions.filter { $0.isActive }
-        let session = PlaybackSession(cue: cue, output: output, video: video)
-        sessions.append(session)
-        Task {
-            do {
-                try await session.prepare(fromMedia: startMedia)
-                if session.isCancelled {
-                    session.finish()
-                    return
-                }
-                if stopOthers {
-                    for p in previous where p.state != .preparing { p.stop(fade: p.cue.stopFade) }
-                    for p in previous where p.state == .preparing { p.stop(fade: 0) }
-                }
-                let soon = HostClock.now() + HostClock.ticks(seconds: 0.06)
-                session.start(at: max(hostTime ?? 0, soon))
-            } catch {
-                session.finish()
-                message = "\(cue.name): \(error.localizedDescription)"
+    /// Starts a group of cues at the same host time, once all of them are prepared.
+    private func start(_ group: [Cue], at hostTime: UInt64?, stopOthers: Bool) {
+        var ready: [(session: PlaybackSession, media: Double)] = []
+        for cue in group {
+            if cue.missing || !FileManager.default.fileExists(atPath: cue.url.path) {
+                message = "File not found: \(cue.url.path)"
+                continue
             }
+            if output == nil && !cue.audioTracks.isEmpty {
+                message = "No audio output: \(outputStatus). \(cue.name) plays without sound."
+            }
+            let startMedia = pendingStarts[cue.id].map { cue.mediaTime(forFile: min(cue.seekTarget($0), cue.segmentEnd)) } ?? 0
+            pendingStarts[cue.id] = nil
+            ready.append((PlaybackSession(cue: cue, output: output, video: video), startMedia))
+        }
+        guard !ready.isEmpty else { return }
+        let previous = sessions.filter { $0.isActive }
+        sessions.append(contentsOf: ready.map(\.session))
+        Task {
+            var prepared: [PlaybackSession] = []
+            for (session, media) in ready {
+                do {
+                    try await session.prepare(fromMedia: media)
+                    if session.isCancelled { session.finish() } else { prepared.append(session) }
+                } catch {
+                    session.finish()
+                    message = "\(session.cue.name): \(error.localizedDescription)"
+                }
+            }
+            guard !prepared.isEmpty else { return }
+            if stopOthers {
+                for p in previous where p.state != .preparing { p.stop(fade: p.cue.stopFade) }
+                for p in previous where p.state == .preparing { p.stop(fade: 0) }
+            }
+            let soon = HostClock.now() + HostClock.ticks(seconds: 0.06)
+            let at = max(hostTime ?? 0, soon)
+            for s in prepared { s.start(at: at) }
         }
     }
 
@@ -585,12 +636,17 @@ final class PlaybackEngine: NSObject, ObservableObject {
     @objc private func tickTimer() {
         for s in sessions { s.tick() }
 
-        // Auto-follow: schedule the next cue to start exactly when this one ends.
-        for s in sessions where s.state == .playing && s.cue.endAction == .next && !s.followTriggered {
-            if s.remaining < 1.5, let i = cues.firstIndex(where: { $0.id == s.cue.id }), i + 1 < cues.count {
-                s.followTriggered = true
-                start(cues[i + 1], at: s.endHostTime, stopOthers: false)
-                selection = i + 2 < cues.count ? cues[i + 2].id : cues[i + 1].id
+        // Autostart "at end of previous cue": schedule the next cue (and the cues
+        // that start with it) to start exactly when this one ends.
+        for s in sessions where s.state == .playing && s.cue.endAction != .loop && !s.followTriggered {
+            guard s.remaining < 1.5, let i = cues.firstIndex(where: { $0.id == s.cue.id }),
+                  i + 1 < cues.count, cues[i + 1].autoStart == .afterPrevious else { continue }
+            s.followTriggered = true
+            let followers = group(from: i + 1)
+            start(followers, at: s.endHostTime, stopOthers: false)
+            // If GO would play one of these cues next, move on to the next manual cue.
+            if let sel = selection, followers.contains(where: { $0.id == sel }) {
+                selection = nextManualIndex(after: i + followers.count).map { cues[$0].id } ?? sel
             }
         }
         sessions.removeAll { $0.isDone }
@@ -672,7 +728,12 @@ final class PlaybackEngine: NSObject, ObservableObject {
         var loaded = show.cues
         for i in loaded.indices {
             loaded[i].missing = !FileManager.default.fileExists(atPath: loaded[i].url.path)
-            loaded[i].normalizeRoutes(outputChannels: routingChannels)
+            loaded[i].normalizeRoutes(outputChannels: routingChannels, defaults: defaultRouting)
+            // Older shows: "play next cue when finished" is now the next cue's autostart.
+            if loaded[i].endAction == .next {
+                loaded[i].endAction = .stop
+                if i + 1 < loaded.count && loaded[i + 1].autoStart == .off { loaded[i + 1].autoStart = .afterPrevious }
+            }
         }
         cues = loaded
         pendingStarts = [:]

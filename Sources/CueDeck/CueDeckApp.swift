@@ -12,6 +12,10 @@ struct CueDeckApp: App {
                 .environmentObject(engine)
                 .frame(minWidth: 1000, minHeight: 620)
         }
+        Settings {
+            SettingsView()
+                .environmentObject(engine)
+        }
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("New Show") { engine.newShow() }
@@ -79,6 +83,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // sheets (e.g. Output names) alone.
         if NSApp.keyWindow?.firstResponder is NSText { return event }
         if NSApp.keyWindow?.isSheet == true || NSApp.keyWindow?.attachedSheet != nil { return event }
+        // Never GO or delete cues from the Settings window.
+        if NSApp.keyWindow?.identifier?.rawValue.localizedCaseInsensitiveContains("settings") == true { return event }
         let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
             .subtracting([.capsLock, .numericPad, .function])
         let engine = PlaybackEngine.shared

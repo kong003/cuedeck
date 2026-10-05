@@ -34,11 +34,15 @@ open build/CueDeck.app
    - Speed 0.25× to 4× (pitch preserved)
    - Volume, fade in, fade out at the end, fade when stopped
    - Start/end points to trim the file
-   - When finished: stop, play the next cue (seamlessly), or loop
+   - When finished: stop or loop
+   - **Autostart** (dropdown in the cue list): no autostart, at the end of the
+     previous cue (seamlessly), or together with the previous cue. GO skips
+     cues that start by themselves.
    - **Audio routing**: each audio stream has an output dropdown, right in the
      cue list and in the inspector (stream 1 → 1–2, stream 2 → 3–4, …). Open
      "channels" in the inspector to route single channels. Changes apply
-     instantly, also while playing.
+     instantly, also while playing. The routing new cues get is set in
+     CueDeck › Settings (⌘,): choose the first output for each stream.
    - **Names**: rename audio streams in the inspector; name the outputs
      themselves with *Output names…* in the bottom bar.
 4. **Jump around**: click or drag the timeline in the inspector or at the

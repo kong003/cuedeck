@@ -4,6 +4,12 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @EnvironmentObject var engine: PlaybackEngine
+    @AppStorage("cueListWidth") private var cueListWidth = 480.0
+    @AppStorage("bottomPanelHeight") private var bottomHeight = 220.0
+
+    private func clamp(_ v: Double, _ lo: Double, _ hi: Double) -> Double {
+        min(max(v, lo), max(lo, hi))
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -23,14 +29,25 @@ struct ContentView: View {
                 .background(Color.accentColor.opacity(0.12))
             }
             Divider()
-            HSplitView {
-                CueListView()
-                    .frame(minWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
-                InspectorPane()
-                    .frame(minWidth: 400, idealWidth: 450, maxWidth: 640, maxHeight: .infinity)
+            // Own split handles instead of HSplitView/VSplitView: the sizes only
+            // change when the user drags, never because the content changes.
+            GeometryReader { geo in
+                let listWidth = clamp(cueListWidth, 320, geo.size.width - 400)
+                let bottom = clamp(bottomHeight, 110, geo.size.height - 220)
+                VStack(spacing: 0) {
+                    HStack(spacing: 0) {
+                        CueListView()
+                            .frame(width: listWidth)
+                        SplitHandle(vertical: true, value: $cueListWidth, current: listWidth)
+                        InspectorPane()
+                            .frame(maxWidth: .infinity)
+                    }
+                    .frame(maxHeight: .infinity)
+                    SplitHandle(vertical: false, value: $bottomHeight, current: bottom, inverted: true)
+                    WaveformPanel()
+                        .frame(height: bottom)
+                }
             }
-            Divider()
-            WaveformPanel()
             Divider()
             OutputBar()
         }
@@ -42,6 +59,47 @@ struct ContentView: View {
                 if e.message == msg { e.message = nil }
             }
         }
+    }
+}
+
+/// A divider that can be dragged to resize the views next to it.
+/// `vertical`: a vertical line dragged left/right; otherwise horizontal, dragged up/down.
+/// `inverted`: dragging up/left makes `value` bigger (for a panel below or right of the handle).
+struct SplitHandle: View {
+    let vertical: Bool
+    @Binding var value: Double
+    /// The size actually shown (value after clamping), where a drag starts from.
+    let current: Double
+    var inverted = false
+    @State private var dragStart: Double?
+
+    var body: some View {
+        Divider()
+            .overlay(
+                Color.clear
+                    .frame(width: vertical ? 9 : nil, height: vertical ? nil : 9)
+                    .contentShape(Rectangle())
+                    .onHover { inside in
+                        if inside {
+                            (vertical ? NSCursor.resizeLeftRight : NSCursor.resizeUpDown).push()
+                        } else {
+                            NSCursor.pop()
+                        }
+                    }
+                    .gesture(
+                        DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                            .onChanged { g in
+                                if dragStart == nil { dragStart = current }
+                                let delta = vertical ? g.translation.width : g.translation.height
+                                value = (dragStart ?? current) + (inverted ? -delta : delta)
+                            }
+                            .onEnded { _ in
+                                value = current
+                                dragStart = nil
+                            }
+                    )
+            )
+            .zIndex(1)
     }
 }
 
@@ -320,8 +378,7 @@ struct CueRow: View {
         if cue.fadeIn > 0 || cue.fadeOut > 0 { parts.append("fades") }
         switch cue.endAction {
         case .loop: parts.append("loop")
-        case .next: parts.append("→ next")
-        case .stop: break
+        case .stop, .next: break
         }
         if !cue.markers.isEmpty { parts.append("\(cue.markers.count) marker\(cue.markers.count == 1 ? "" : "s")") }
         return parts.joined(separator: " · ")
@@ -357,6 +414,7 @@ struct CueRow: View {
                 }
             }
             Spacer()
+            AutoStartMenu(cue: cue, isFirst: number == 1)
             if active {
                 Button { engine.stopCue(cue.id) } label: {
                     Image(systemName: "stop.circle.fill").foregroundStyle(.red)
@@ -370,5 +428,35 @@ struct CueRow: View {
                 .fixedSize()
         }
         .padding(.vertical, 3)
+    }
+}
+
+/// Dropdown in the cue list: whether the cue starts by itself after or with the cue above it.
+struct AutoStartMenu: View {
+    @EnvironmentObject var engine: PlaybackEngine
+    let cue: Cue
+    let isFirst: Bool
+
+    /// The first cue has no previous cue, so it always waits for GO.
+    private var mode: AutoStart { isFirst ? .off : cue.autoStart }
+
+    var body: some View {
+        Menu {
+            ForEach(AutoStart.allCases) { mode in
+                Button { engine.setAutoStart(cue.id, mode) } label: {
+                    if cue.autoStart == mode { Label(mode.label, systemImage: "checkmark") } else { Text(mode.label) }
+                }
+            }
+        } label: {
+            Label(mode.shortLabel, systemImage: mode.systemImage)
+                .lineLimit(1)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .font(.caption)
+        .foregroundStyle(mode == .off ? Color.secondary : Color.accentColor)
+        .disabled(isFirst)
+        .help(isFirst ? "The first cue always waits for GO"
+                      : "Autostart: \(mode.label). Choose whether this cue starts by itself.")
     }
 }

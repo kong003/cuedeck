@@ -57,10 +57,6 @@ struct CueInspector: View {
                     "\(cue.audioTracks.count) stream(s), \(cue.audioTracks.reduce(0) { $0 + $1.channels }) channels")
             }
 
-            Section("Timeline") {
-                CueTimelineSection(cue: $cue)
-            }
-
             Section {
                 LabeledContent("Speed") {
                     HStack {
@@ -95,7 +91,7 @@ struct CueInspector: View {
                 TimeRow(title: "Start point", value: $cue.inPoint, placeholder: "00:00.00")
                 TimeRow(title: "End point", value: $cue.outPoint, placeholder: "end of file")
                 Picker("When finished", selection: $cue.endAction) {
-                    ForEach(EndAction.allCases) { Text($0.label).tag($0) }
+                    ForEach(EndAction.selectable) { Text($0.label).tag($0) }
                 }
                 LabeledContent("Plays for", value: cue.endAction == .loop ? "Until stopped" : formatTime(cue.playDuration))
             } header: {
@@ -105,15 +101,19 @@ struct CueInspector: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
 
+            Section("Timeline") {
+                CueTimelineSection(cue: $cue)
+            }
+
             Section {
                 RoutingEditor(cue: $cue, outputChannels: outputChannels)
             } header: {
                 HStack {
                     Text("Audio routing")
                     Spacer()
-                    Button("Auto-assign") { engine.resetRoutes(for: cue.id) }
+                    Button("Apply Default") { engine.resetRoutes(for: cue.id) }
                         .controlSize(.small)
-                        .help("Stream 1 → outputs 1–2, stream 2 → outputs 3–4, …")
+                        .help("Route this cue with the default routing from Settings (⌘,)")
                 }
             }
         }

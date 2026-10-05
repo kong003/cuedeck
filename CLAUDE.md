@@ -46,6 +46,7 @@ mixer, one small Objective-C helper. macOS 13+, Apple Silicon.
 - UI: `ContentView`, `InspectorView`, `TimelineViews`, `Waveform` (bottom
   panel: whole-file ruler with start/end handles + per-channel waveforms),
   `Layouts.swift` (`FlowLayout` for wrapping in narrow windows).
+  `SettingsView` (⌘,): default audio routing per stream (`RoutingDefault`).
 - `Sources/ObjCSupport`: `CDCatchException`. AVFoundation raises Objective-C
   exceptions for settings it rejects, which Swift can't catch and which kill
   the app. Wrap risky AVFoundation calls (reader outputs, `canAdd`/`add`) in it.
