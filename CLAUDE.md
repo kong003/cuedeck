@@ -49,7 +49,15 @@ mixer, one small Objective-C helper. macOS 13+, Apple Silicon.
 - UI: `ContentView`, `InspectorView`, `TimelineViews`, `Waveform` (bottom
   panel: whole-file ruler with start/end handles + per-channel waveforms),
   `Layouts.swift` (`FlowLayout` for wrapping in narrow windows).
-  `SettingsView` (⌘,): default audio routing per stream (`RoutingDefault`).
+  `SettingsView` (⌘,): default audio routing per stream (`RoutingDefault`)
+  and the CasparCG server.
+- `Caspar.swift` (`CasparOutput`): AMCP over TCP (Network framework) to a
+  CasparCG server. The engine calls `update(lines)` every tick (nil = clear
+  layer, [] = template loaded, no text); only changes are sent, everything is
+  re-sent after a reconnect. Template `template/caspardcg/subtitle.html`
+  (webcg): data `{"step":{"0":{"lines":[…]}}}`, shown with `CG INVOKE "show"`.
+  Layer fixed at 20. Subtitles come from tx3g tracks (`SubtitleReader` in
+  `Media.swift`), timed by the session's `displayedFileTime`.
 - `Sources/ObjCSupport`: `CDCatchException`. AVFoundation raises Objective-C
   exceptions for settings it rejects, which Swift can't catch and which kill
   the app. Wrap risky AVFoundation calls (reader outputs, `canAdd`/`add`) in it.

@@ -84,6 +84,19 @@ newer) and packs it into `build/CueDeck-<version>.dmg`.
 
 The cue list is also autosaved and restored on the next launch.
 
+## Subtitles to CasparCG
+
+Subtitles embedded in MP4 or MOV files (text tracks, as ffmpeg writes with
+`-c:s mov_text`) can play on a CasparCG server in time with the cue.
+
+1. Copy `template/caspardcg` into the template folder of the server.
+2. In CueDeck › Settings (⌘,) › CasparCG, turn on *Send subtitles to
+   CasparCG* and enter the server IP and the channel. The template name
+   defaults to `caspardcg/subtitle`; CueDeck uses layer 20 of the channel.
+   *Send Test Subtitle* checks the connection.
+3. Cues with subtitles get a *Subtitles* menu in the cue list to choose the
+   language or switch them off.
+
 ## Supported formats
 
 Everything AVFoundation plays: MOV, MP4, M4V with H.264, HEVC, ProRes (incl.

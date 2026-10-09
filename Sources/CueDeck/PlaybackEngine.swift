@@ -100,6 +100,11 @@ final class PlaybackEngine: NSObject, ObservableObject {
     @Published var message: String?
 
     let video = VideoOutput()
+    /// Subtitles to CasparCG (Settings › CasparCG).
+    let caspar = CasparOutput()
+    /// Subtitles read from files, by "path|trackID".
+    private var subtitleCache: [String: [SubtitleEntry]] = [:]
+    private var subtitlesLoading: Set<String> = []
     private var output: AudioOutput?
     private var sessions: [PlaybackSession] = []
     private var timer: Timer?
@@ -483,6 +488,13 @@ final class PlaybackEngine: NSObject, ObservableObject {
         updateCue(cue)
     }
 
+    /// Which subtitle track goes to CasparCG, -1 = off. Applies live.
+    func setSubtitleTrack(_ id: UUID, _ index: Int) {
+        guard !showMode, var cue = findCue(id) else { return }
+        cue.subtitleTrack = index
+        updateCue(cue)
+    }
+
     func setAutoStart(_ id: UUID, _ mode: AutoStart) {
         guard !showMode, var cue = findCue(id) else { return }
         cue.autoStart = mode
@@ -726,9 +738,43 @@ final class PlaybackEngine: NSObject, ObservableObject {
             }
         }
         sessions.removeAll { $0.isDone }
+        updateSubtitles()
 
         tickCount += 1
         if tickCount % 4 == 0 { publishStatus() }
+    }
+
+    // MARK: - Subtitles
+
+    /// Sends the subtitle of the newest playing cue that has subtitles switched on.
+    private func updateSubtitles() {
+        guard caspar.enabled else { return }
+        let candidate = sessions.last { s in
+            (s.state == .preparing || s.state == .playing || s.state == .paused)
+                && findCue(s.cue.id)?.selectedSubtitles != nil
+        }
+        // The cue in the list, so a subtitle language picked while playing applies at once.
+        guard let s = candidate, let cue = findCue(s.cue.id), let track = cue.selectedSubtitles else {
+            caspar.update(nil)
+            return
+        }
+        let key = "\(cue.url.path)|\(track.trackID)"
+        guard let entries = subtitleCache[key], s.state != .preparing else {
+            loadSubtitles(url: cue.url, trackID: track.trackID, key: key)
+            caspar.update([])          // load the template now, so it is ready for the first line
+            return
+        }
+        caspar.update(SubtitleReader.entry(at: s.displayedFileTime, in: entries)?.lines ?? [])
+    }
+
+    private func loadSubtitles(url: URL, trackID: Int32, key: String) {
+        guard subtitleCache[key] == nil, !subtitlesLoading.contains(key) else { return }
+        subtitlesLoading.insert(key)
+        Task {
+            let entries = await SubtitleReader.load(url: url, trackID: trackID)
+            subtitleCache[key] = entries
+            subtitlesLoading.remove(key)
+        }
     }
 
     private func publishStatus() {
@@ -821,14 +867,21 @@ final class PlaybackEngine: NSObject, ObservableObject {
     /// Reads the stream names from the files again (shows saved before
     /// CueDeck read them, or files that changed).
     private func refreshStreamNames() {
-        let list = cues.filter { !$0.missing && !$0.audioTracks.isEmpty }.map { ($0.id, $0.url) }
+        let list = cues.filter { !$0.missing && $0.duration > 0 }.map { ($0.id, $0.url) }
         Task {
             for (id, url) in list {
-                guard let names = await MediaInspector.trackNames(of: url), var cue = findCue(id),
-                      names.count == cue.audioTracks.count,
-                      names != cue.audioTracks.map(\.fileName) else { continue }
-                for i in names.indices { cue.audioTracks[i].fileName = names[i] }
-                withoutUndo { updateCue(cue) }
+                let names = await MediaInspector.trackNames(of: url)
+                let subtitles = await MediaInspector.subtitleTracks(of: url)
+                guard var cue = findCue(id) else { continue }
+                let before = cue
+                if let names, names.count == cue.audioTracks.count {
+                    for i in names.indices { cue.audioTracks[i].fileName = names[i] }
+                }
+                if subtitles != cue.subtitleTracks {
+                    cue.subtitleTracks = subtitles
+                    if cue.subtitleTrack >= subtitles.count { cue.subtitleTrack = subtitles.isEmpty ? 0 : -1 }
+                }
+                if cue != before { withoutUndo { updateCue(cue) } }
             }
         }
     }
@@ -895,6 +948,7 @@ final class PlaybackEngine: NSObject, ObservableObject {
     /// Called when the app quits.
     func shutdown() {
         timer?.invalidate()
+        caspar.shutdown()
         stopAll(fade: false)
         video.close()
         autosaveWork?.perform()

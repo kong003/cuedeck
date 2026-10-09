@@ -55,6 +55,8 @@ struct CueInspector: View {
                 LabeledContent("Video", value: cue.hasVideo ? (cue.videoSize.isEmpty ? "Yes" : cue.videoSize) : "None")
                 LabeledContent("Audio", value: cue.audioTracks.isEmpty ? "None" :
                     "\(cue.audioTracks.count) stream\(cue.audioTracks.count == 1 ? "" : "s"), \(cue.audioTracks.reduce(0) { $0 + $1.channels }) channels")
+                LabeledContent("Subtitles", value: cue.subtitleTracks.isEmpty ? "None" :
+                    cue.subtitleTracks.map(\.displayName).joined(separator: ", "))
             }
 
             Section {

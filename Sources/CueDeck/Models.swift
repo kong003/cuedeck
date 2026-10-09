@@ -102,6 +102,25 @@ struct AudioTrackInfo: Codable, Equatable, Identifiable {
     }
 }
 
+/// A subtitle track (text, tx3g) found in a media file.
+struct SubtitleTrackInfo: Codable, Equatable, Identifiable {
+    var index: Int                  // order among the file's subtitle tracks
+    var trackID: Int32              // AVAssetTrack.trackID, to read the track again
+    var language: String = ""       // ISO code, e.g. "deu"
+    var fileName: String = ""       // name stored in the file, if any
+    var id: Int { index }
+
+    /// "German", the file's name for the track, or "Subtitles 1".
+    var displayName: String {
+        let f = fileName.trimmingCharacters(in: .whitespaces)
+        if !f.isEmpty { return f }
+        if !language.isEmpty, let name = Locale(identifier: "en").localizedString(forLanguageCode: language) {
+            return name
+        }
+        return "Subtitles \(index + 1)"
+    }
+}
+
 /// Special values in the default routing (Settings). Other values are the
 /// first output of the stream, 0 based.
 enum RoutingDefault {
@@ -141,11 +160,19 @@ struct Cue: Identifiable, Codable, Equatable {
     var videoSize: String = ""
     var frameRate: Double = 0          // video frames per second, 0 = unknown / no video
     var audioTracks: [AudioTrackInfo] = []
+    var subtitleTracks: [SubtitleTrackInfo] = []
+    /// Index into `subtitleTracks` sent to CasparCG, -1 = off.
+    var subtitleTrack: Int = 0
     var missing: Bool = false
 
     init(url: URL) {
         self.url = url
         self.name = url.deletingPathExtension().lastPathComponent
+    }
+
+    /// The subtitle track sent to CasparCG, nil = off or none.
+    var selectedSubtitles: SubtitleTrackInfo? {
+        subtitleTrack >= 0 && subtitleTrack < subtitleTracks.count ? subtitleTracks[subtitleTrack] : nil
     }
 
     /// Whether playing this cue shows video.
@@ -265,7 +292,8 @@ struct Cue: Identifiable, Codable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case id, url, name, speed, volumeDB, fadeIn, fadeOut, stopFade, inPoint, outPoint,
-             endAction, autoStart, audioOnly, playAlongside, routes, duration, hasVideo, videoSize, frameRate, audioTracks
+             endAction, autoStart, audioOnly, playAlongside, routes, duration, hasVideo, videoSize, frameRate, audioTracks,
+             subtitleTracks, subtitleTrack
     }
 
     init(from decoder: Decoder) throws {
@@ -290,6 +318,8 @@ struct Cue: Identifiable, Codable, Equatable {
         videoSize = try c.decodeIfPresent(String.self, forKey: .videoSize) ?? ""
         frameRate = try c.decodeIfPresent(Double.self, forKey: .frameRate) ?? 0
         audioTracks = try c.decodeIfPresent([AudioTrackInfo].self, forKey: .audioTracks) ?? []
+        subtitleTracks = try c.decodeIfPresent([SubtitleTrackInfo].self, forKey: .subtitleTracks) ?? []
+        subtitleTrack = try c.decodeIfPresent(Int.self, forKey: .subtitleTrack) ?? 0
     }
 
     func encode(to encoder: Encoder) throws {
@@ -314,6 +344,8 @@ struct Cue: Identifiable, Codable, Equatable {
         try c.encode(videoSize, forKey: .videoSize)
         try c.encode(frameRate, forKey: .frameRate)
         try c.encode(audioTracks, forKey: .audioTracks)
+        try c.encode(subtitleTracks, forKey: .subtitleTracks)
+        try c.encode(subtitleTrack, forKey: .subtitleTrack)
     }
 }
 

@@ -617,6 +617,11 @@ struct CueRow: View {
                             .font(.caption)
                             .disabled(engine.showMode)
                     }
+                    if !cue.subtitleTracks.isEmpty {
+                        SubtitleMenu(cue: cue)
+                            .font(.caption)
+                            .disabled(engine.showMode)
+                    }
                     if cue.hasVideo {
                         Toggle("Audio only", isOn: Binding(
                             get: { cue.audioOnly },
@@ -650,6 +655,42 @@ struct CueRow: View {
                 }
                 .padding(.horizontal, -6)
             }
+        }
+    }
+}
+
+/// Dropdown in the cue list: which subtitle track goes to CasparCG, or off.
+struct SubtitleMenu: View {
+    @EnvironmentObject var engine: PlaybackEngine
+    let cue: Cue
+
+    var body: some View {
+        Menu {
+            item("Off", selected: cue.selectedSubtitles == nil) { engine.setSubtitleTrack(cue.id, -1) }
+            Divider()
+            ForEach(cue.subtitleTracks) { track in
+                item(track.displayName, selected: cue.subtitleTrack == track.index) {
+                    engine.setSubtitleTrack(cue.id, track.index)
+                }
+            }
+        } label: {
+            Label(cue.selectedSubtitles.map { "Subtitles · \($0.displayName)" } ?? "Subtitles off",
+                  systemImage: "captions.bubble")
+                .lineLimit(1)
+        }
+        .menuStyle(.button)
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .fixedSize()
+        .help(engine.caspar.enabled
+              ? "Choose which subtitles are sent to CasparCG while this cue plays"
+              : "Choose the subtitles for CasparCG. The CasparCG output is off, turn it on in Settings (⌘,).")
+    }
+
+    @ViewBuilder
+    private func item(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            if selected { Label(title, systemImage: "checkmark") } else { Text(title) }
         }
     }
 }

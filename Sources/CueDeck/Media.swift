@@ -1,6 +1,7 @@
 import AVFoundation
 import CoreMedia
 import Foundation
+import ObjCSupport
 
 enum MediaError: LocalizedError {
     case notPlayable(String)
@@ -133,6 +134,28 @@ enum MediaInspector {
             infos.append(info)
         }
         cue.audioTracks = infos
+        cue.subtitleTracks = await subtitleTracks(of: asset, handlerNames: handlerNames)
+        if cue.subtitleTrack >= cue.subtitleTracks.count { cue.subtitleTrack = cue.subtitleTracks.isEmpty ? 0 : -1 }
+    }
+
+    /// Text subtitle tracks (tx3g, as in MP4/MOV) that CueDeck can read.
+    static func subtitleTracks(of asset: AVAsset, handlerNames: [CMPersistentTrackID: String]) async -> [SubtitleTrackInfo] {
+        guard let tracks = try? await asset.load(.tracks) else { return [] }
+        var result: [SubtitleTrackInfo] = []
+        for t in tracks where t.mediaType == .subtitle || t.mediaType == .text {
+            guard let fds = try? await t.load(.formatDescriptions),
+                  let fd = fds.first, CMFormatDescriptionGetMediaSubType(fd) == SubtitleReader.tx3g else { continue }
+            var info = SubtitleTrackInfo(index: result.count, trackID: t.trackID)
+            let lang = (try? await t.load(.languageCode)) ?? nil
+            if let lang, lang != "und" { info.language = lang }
+            info.fileName = await trackName(t, handlerNames: handlerNames)
+            result.append(info)
+        }
+        return result
+    }
+
+    static func subtitleTracks(of url: URL) async -> [SubtitleTrackInfo] {
+        await subtitleTracks(of: AVURLAsset(url: url), handlerNames: MovieHeader.handlerNames(of: url))
     }
 
     /// The name a track carries in the file, "" if none: the QuickTime track
@@ -363,5 +386,70 @@ enum MovieHeader {
         if let zero = bytes.firstIndex(of: 0) { bytes = Array(bytes[..<zero]) }
         let name = String(decoding: bytes, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
         return name.isEmpty ? nil : name
+    }
+}
+
+/// One subtitle on screen from `start` to `end` (seconds in the file).
+struct SubtitleEntry: Equatable {
+    var start: Double
+    var end: Double
+    var lines: [String]
+}
+
+/// Reads the text of a tx3g subtitle track.
+enum SubtitleReader {
+    static let tx3g: FourCharCode = 0x74783367   // 'tx3g'
+
+    static func load(url: URL, trackID: Int32) async -> [SubtitleEntry] {
+        let asset = AVURLAsset(url: url)
+        guard let track = try? await asset.loadTrack(withTrackID: trackID) else { return [] }
+        return await Task.detached(priority: .userInitiated) { read(asset: asset, track: track) }.value
+    }
+
+    private static func read(asset: AVAsset, track: AVAssetTrack) -> [SubtitleEntry] {
+        guard let reader = try? AVAssetReader(asset: asset) else { return [] }
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+        var added = false
+        let problem = CDCatchException({
+            if reader.canAdd(output) { reader.add(output); added = true }
+        })
+        guard problem == nil, added, reader.startReading() else { return [] }
+
+        var entries: [SubtitleEntry] = []
+        while let sample = output.copyNextSampleBuffer() {
+            let start = CMSampleBufferGetPresentationTimeStamp(sample).seconds
+            let duration = CMSampleBufferGetDuration(sample).seconds
+            guard start.isFinite, duration.isFinite, duration > 0,
+                  let text = text(of: sample), !text.isEmpty else { continue }
+            let lines = text.components(separatedBy: .newlines)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+            if !lines.isEmpty { entries.append(SubtitleEntry(start: start, end: start + duration, lines: lines)) }
+        }
+        return entries.sorted { $0.start < $1.start }
+    }
+
+    /// tx3g sample: 16-bit big-endian length, UTF-8 text, then optional style boxes.
+    private static func text(of sample: CMSampleBuffer) -> String? {
+        guard let block = CMSampleBufferGetDataBuffer(sample) else { return nil }
+        let total = CMBlockBufferGetDataLength(block)
+        guard total >= 2 else { return nil }
+        var bytes = [UInt8](repeating: 0, count: total)
+        guard CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: total, destination: &bytes) == noErr else { return nil }
+        let length = Int(bytes[0]) << 8 | Int(bytes[1])
+        guard length > 0 else { return "" }
+        return String(decoding: bytes[2..<min(2 + length, total)], as: UTF8.self)
+            .replacingOccurrences(of: "\r\n", with: "\n")
+    }
+
+    /// The subtitle shown at file time `t`, nil = none.
+    static func entry(at t: Double, in entries: [SubtitleEntry]) -> SubtitleEntry? {
+        var lo = 0, hi = entries.count - 1, found: Int?
+        while lo <= hi {                       // last entry starting at or before t
+            let mid = (lo + hi) / 2
+            if entries[mid].start <= t { found = mid; lo = mid + 1 } else { hi = mid - 1 }
+        }
+        guard let i = found, t < entries[i].end else { return nil }
+        return entries[i]
     }
 }
