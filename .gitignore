@@ -6,3 +6,4 @@ build/
 Tests/cmixer/test_mixer
 Tests/cmixer/test_mixer.dSYM/
 .build-x86/
+template/
