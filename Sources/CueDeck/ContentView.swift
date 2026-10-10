@@ -458,23 +458,26 @@ struct CueListView: View {
                 }
             }
             .overlay {
+                // An empty list has no rows to drop between, so this hint takes the drop.
+                // (It only exists while the list is empty, so it never hides rows.)
                 if engine.cues.isEmpty {
                     VStack(spacing: 8) {
                         Image(systemName: "film.stack").font(.system(size: 40)).foregroundStyle(.secondary)
                         Text("Drop video or audio files here").font(.title3)
                         Text("or use File › Add Media… (⌘I)").foregroundStyle(.secondary)
                     }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .contentShape(Rectangle())
+                    .onDrop(of: [UTType.fileURL], isTargeted: $dropTargeted) { providers in
+                        loadURLs(providers) { engine.addFiles($0) }
+                        return true
+                    }
                 }
             }
             .overlay {
-                if dropTargeted {
+                if dropTargeted && engine.cues.isEmpty {
                     RoundedRectangle(cornerRadius: 8).stroke(Color.accentColor, lineWidth: 3).padding(4)
                 }
-            }
-            // An empty list has no rows to drop between, so it takes drops as a whole.
-            .onDrop(of: engine.cues.isEmpty ? [UTType.fileURL] : [], isTargeted: $dropTargeted) { providers in
-                loadURLs(providers) { engine.addFiles($0) }
-                return true
             }
 
             if !engine.showMode { footer }

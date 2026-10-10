@@ -71,7 +71,10 @@ final class PlaybackSession: Identifiable {
 
     private var stopStartedAt: CFTimeInterval = 0
     private var stopFade: Double = 0
-    private var stopStartOpacity: Float = 1
+    /// Video fades run as Core Animation (smooth even when the UI is busy).
+    /// Until this time (CACurrentMediaTime) tick() leaves the opacity alone.
+    private var fadeAnimationEnd: CFTimeInterval = 0
+    private var endFadeScheduled = false
 
     private var seekGeneration = 0
     private var seeking = false
@@ -206,12 +209,16 @@ final class PlaybackSession: Identifiable {
         setAnchor(host: host, media: pausedMedia, previousSpeed: 0)
         if voice >= 0, let out = output { cm_voice_start(out.mixer, voice, host) }
         player?.setRate(Float(speed), time: cmTime(pausedMedia), atHostTime: HostClock.cmTime(host))
+        // Fade the picture in from the exact start time (instantly without a fade in).
+        let fadeIn = pausedMedia <= 0 ? cue.fadeIn : 0
+        animateOpacity(to: 1, over: fadeIn, from: 0, beginAt: Double(host) / HostClock.ticksPerSecond)
         state = .playing
         startSpeedTaskIfNeeded()
     }
 
     func pause() {
         guard state == .playing else { return }
+        cancelFadeAnimation()
         releaseRetiring()
         pausedMedia = mediaTime
         if voice >= 0, let out = output {
@@ -265,7 +272,7 @@ final class PlaybackSession: Identifiable {
         }
         stopFade = fade
         stopStartedAt = CACurrentMediaTime()
-        stopStartOpacity = playerLayer?.opacity ?? 1
+        animateOpacity(to: 0, over: fade)
         state = .stopping
     }
 
@@ -273,6 +280,46 @@ final class PlaybackSession: Identifiable {
         anchorHost = host
         anchorMedia = media
         anchorPreviousSpeed = previousSpeed
+    }
+
+    // MARK: - Video opacity
+
+    private func setOpacity(_ value: Float) {
+        guard let layer = playerLayer else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.opacity = value
+        CATransaction.commit()
+    }
+
+    /// Animates the picture's opacity on the render server, from what is on
+    /// screen now (or `from`), starting now or at `beginAt` (CACurrentMediaTime).
+    private func animateOpacity(to target: Float, over duration: Double, from: Float? = nil,
+                                beginAt: CFTimeInterval? = nil) {
+        guard let layer = playerLayer else { return }
+        let start = from ?? layer.presentation()?.opacity ?? layer.opacity
+        layer.removeAnimation(forKey: "fade")
+        setOpacity(target)
+        let begin = beginAt ?? CACurrentMediaTime()
+        let animation = CABasicAnimation(keyPath: "opacity")
+        animation.fromValue = start
+        animation.toValue = target
+        animation.duration = max(duration, 0.001)
+        animation.timingFunction = CAMediaTimingFunction(name: .linear)
+        animation.beginTime = layer.convertTime(begin, from: nil)
+        animation.fillMode = .backwards        // holds `start` until it begins
+        layer.add(animation, forKey: "fade")
+        fadeAnimationEnd = begin + animation.duration
+    }
+
+    /// Keeps the opacity that is on screen and hands it back to tick().
+    private func cancelFadeAnimation() {
+        guard let layer = playerLayer else { return }
+        let current = layer.presentation()?.opacity ?? layer.opacity
+        layer.removeAnimation(forKey: "fade")
+        setOpacity(current)
+        fadeAnimationEnd = 0
+        endFadeScheduled = false
     }
 
     /// Frees the stream that is being crossfaded away (if any).
@@ -562,18 +609,21 @@ final class PlaybackSession: Identifiable {
             stopProgress = stopFade > 0 ? (CACurrentMediaTime() - stopStartedAt) / stopFade : 1
         }
 
-        if let layer = playerLayer {
-            var o = 1.0
-            if cue.fadeIn > 0 { o = min(o, elapsedOut / cue.fadeIn) }
-            if cue.fadeOut > 0 && cue.endAction != .loop { o = min(o, remainingOut / cue.fadeOut) }
-            if state == .stopping { o = min(o, Double(stopStartOpacity) * (1 - stopProgress)) }
-            if !started { o = 0 }
-            let opacity = Float(min(1, max(0, o)))
-            if layer.opacity != opacity {
-                CATransaction.begin()
-                CATransaction.setDisableActions(true)
-                layer.opacity = opacity
-                CATransaction.commit()
+        if let layer = playerLayer, state == .playing {
+            // Fade out at the end: one animation over the remaining time.
+            if started, !endFadeScheduled, cue.fadeOut > 0, cue.endAction != .loop,
+               remainingOut > 0, remainingOut <= cue.fadeOut {
+                endFadeScheduled = true
+                animateOpacity(to: 0, over: remainingOut)
+            }
+            // Otherwise (after a pause or seek) set the opacity the fades call for.
+            if CACurrentMediaTime() >= fadeAnimationEnd && !endFadeScheduled {
+                var o = 1.0
+                if cue.fadeIn > 0 { o = min(o, elapsedOut / cue.fadeIn) }
+                if cue.fadeOut > 0 && cue.endAction != .loop { o = min(o, remainingOut / cue.fadeOut) }
+                if !started { o = 0 }
+                let opacity = Float(min(1, max(0, o)))
+                if layer.opacity != opacity { setOpacity(opacity) }
             }
         }
         if seeking || speedTask != nil && HostClock.now() < anchorHost { return }
