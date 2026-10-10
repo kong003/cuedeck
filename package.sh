@@ -24,6 +24,7 @@ DMG="build/CueDeck-$VERSION.dmg"
 STAGE="$(mktemp -d)/CueDeck"
 mkdir -p "$STAGE"
 cp -R "$APP" "$STAGE/"
+cp install.sh "$STAGE/install.sh"
 ln -s /Applications "$STAGE/Applications"
 rm -f "$DMG"
 hdiutil create -volname "CueDeck $VERSION" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
