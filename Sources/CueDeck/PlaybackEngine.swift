@@ -488,13 +488,6 @@ final class PlaybackEngine: NSObject, ObservableObject {
         updateCue(cue)
     }
 
-    /// Which subtitle track goes to CasparCG, -1 = off. Applies live.
-    func setSubtitleTrack(_ id: UUID, _ index: Int) {
-        guard !showMode, var cue = findCue(id) else { return }
-        cue.subtitleTrack = index
-        updateCue(cue)
-    }
-
     func setAutoStart(_ id: UUID, _ mode: AutoStart) {
         guard !showMode, var cue = findCue(id) else { return }
         cue.autoStart = mode
@@ -746,14 +739,13 @@ final class PlaybackEngine: NSObject, ObservableObject {
 
     // MARK: - Subtitles
 
-    /// Sends the subtitle of the newest playing cue that has subtitles switched on.
+    /// Sends the subtitle of the newest playing cue that has subtitles.
     private func updateSubtitles() {
         guard caspar.enabled else { return }
         let candidate = sessions.last { s in
             (s.state == .preparing || s.state == .playing || s.state == .paused)
                 && findCue(s.cue.id)?.selectedSubtitles != nil
         }
-        // The cue in the list, so a subtitle language picked while playing applies at once.
         guard let s = candidate, let cue = findCue(s.cue.id), let track = cue.selectedSubtitles else {
             caspar.update(nil)
             return
@@ -877,10 +869,7 @@ final class PlaybackEngine: NSObject, ObservableObject {
                 if let names, names.count == cue.audioTracks.count {
                     for i in names.indices { cue.audioTracks[i].fileName = names[i] }
                 }
-                if subtitles != cue.subtitleTracks {
-                    cue.subtitleTracks = subtitles
-                    if cue.subtitleTrack >= subtitles.count { cue.subtitleTrack = subtitles.isEmpty ? 0 : -1 }
-                }
+                if subtitles != cue.subtitleTracks { cue.subtitleTracks = subtitles }
                 if cue != before { withoutUndo { updateCue(cue) } }
             }
         }

@@ -26,11 +26,20 @@ open build/CueDeck.app
 `./package.sh` builds a universal app (Apple Silicon and Intel, macOS 13 or
 newer) and packs it into `build/CueDeck-<version>.dmg`.
 
-1. Copy the DMG to the other Mac, open it and drag CueDeck into Applications.
-2. The app has no Developer ID signature, so macOS blocks the first launch.
-   Open it once, then go to System Settings › Privacy & Security and click
-   *Open Anyway* (on macOS 14 and older, right-click the app › Open also works).
-   After that it starts normally.
+1. Copy the DMG to the other Mac and open it.
+2. In Terminal, run the install script from the DMG (drag `install.sh` from
+   the DMG window into Terminal after typing `sh `):
+
+   ```sh
+   sh "/Volumes/CueDeck 0.4.1/install.sh"
+   ```
+
+   It quits CueDeck, replaces the app in Applications, removes the
+   quarantine flag (the app has no Developer ID signature, so macOS would
+   block it) and starts it. Cue list and settings are kept.
+
+Without the script: drag CueDeck into Applications, then run
+`xattr -dr com.apple.quarantine /Applications/CueDeck.app` once.
 
 ## Using it
 
@@ -91,11 +100,12 @@ Subtitles embedded in MP4 or MOV files (text tracks, as ffmpeg writes with
 
 1. Copy `template/caspardcg` into the template folder of the server.
 2. In CueDeck › Settings (⌘,) › CasparCG, turn on *Send subtitles to
-   CasparCG* and enter the server IP and the channel. The template name
-   defaults to `caspardcg/subtitle`; CueDeck uses layer 20 of the channel.
+   CasparCG* and enter the server IP and port. Add as many channels as
+   needed with *Add Channel*: all of them show the same subtitles, with the
+   template `caspardcg/subtitle` on layer 20.
    *Send Test Subtitle* checks the connection.
-3. Cues with subtitles get a *Subtitles* menu in the cue list to choose the
-   language or switch them off.
+3. Every cue whose file has subtitles sends its first subtitle track while
+   it plays; nothing needs to be set per cue.
 
 ## Supported formats
 

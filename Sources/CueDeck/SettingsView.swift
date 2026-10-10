@@ -92,14 +92,39 @@ private struct CasparSettingsForm: View {
                     .help("IP address or host name of the CasparCG server")
                 TextField("Port", value: $caspar.port, format: .number.grouping(.never), prompt: Text("5250"))
                     .help("AMCP port of the server, normally 5250")
-                Stepper("Channel \(caspar.channel)", value: $caspar.channel, in: 1...99)
-                    .help("CasparCG channel the subtitles play on. CueDeck uses layer \(CasparOutput.layer) of it.")
-                TextField("Template", text: $caspar.template, prompt: Text("caspardcg/subtitle"))
-                    .help("Name of the subtitle template in the server's template folder")
             } header: {
                 Text("CasparCG server")
             } footer: {
-                Text("Subtitles embedded in MP4 or MOV files are sent with the template on layer \(CasparOutput.layer) of the channel, in time with the cue. Choose the subtitle language of each cue in the cue list. The template files (template/caspardcg) must be in the template folder of the server.")
+                Text("Subtitles embedded in MP4 or MOV files are sent in time with the cue (the first subtitle track of a file). The template folder caspardcg must be in the template folder of the server.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
+            Section {
+                ForEach(caspar.channels.indices, id: \.self) { i in
+                    HStack {
+                        Stepper("Channel \(caspar.channels[i])", value: Binding(
+                            get: { i < caspar.channels.count ? caspar.channels[i] : 1 },
+                            set: { if i < caspar.channels.count { caspar.channels[i] = $0 } }
+                        ), in: 1...99)
+                        .help("CasparCG channel that shows the subtitles, on layer \(CasparOutput.layer)")
+                        Button { caspar.channels.remove(at: i) } label: {
+                            Image(systemName: "minus.circle.fill").foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(caspar.channels.count <= 1)
+                        .help("Remove this channel")
+                    }
+                }
+                Button {
+                    caspar.channels.append((caspar.channels.max() ?? 0) + 1)
+                } label: {
+                    Label("Add Channel", systemImage: "plus")
+                }
+                .help("Show the same subtitles on one more channel")
+            } header: {
+                Text("Channels")
+            } footer: {
+                Text("Every channel shows the same subtitles, on layer \(CasparOutput.layer).")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -110,7 +135,7 @@ private struct CasparSettingsForm: View {
                     Spacer()
                     Button("Send Test Subtitle") { caspar.test() }
                         .disabled(caspar.status != .connected)
-                        .help("Shows a test subtitle on the server for 4 seconds")
+                        .help("Shows a test subtitle on every channel for 4 seconds")
                 }
                 if let error = caspar.serverError {
                     Text("Server answered: \(error)")

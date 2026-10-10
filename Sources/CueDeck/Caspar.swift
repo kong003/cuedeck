@@ -1,18 +1,20 @@
 import Foundation
 import Network
 
-/// Sends the subtitles of the playing cue to a CasparCG server (AMCP over TCP)
-/// using the HTML template `template` (by default the caspardcg/subtitle
-/// template from template/caspardcg) on `channel`, layer `layer`.
+/// Sends the subtitles of the playing cue to a CasparCG server (AMCP over TCP):
+/// the same lines on every channel in `channels`, with the HTML template
+/// `template` (template/caspardcg/subtitle.html on the server) on layer `layer`.
 ///
 /// The engine calls `update(_:)` on every tick with what should be on air:
-/// nil = no cue with subtitles (layer cleared), [] = template loaded but no
+/// nil = no cue with subtitles (layers cleared), [] = template loaded but no
 /// text right now, otherwise the lines. Only changes are sent; after a
 /// reconnect everything is sent again.
 @MainActor
 final class CasparOutput: ObservableObject {
-    /// CueDeck is the only thing playing on its channel, so a fixed layer is fine.
+    /// CueDeck is the only thing playing on its channels, so a fixed layer is fine.
     static let layer = 20
+    /// The subtitle template in the server's template folder (always the same).
+    static let template = "caspardcg/subtitle"
 
     enum Status: Equatable {
         case off, connecting, connected, failed(String)
@@ -21,25 +23,30 @@ final class CasparOutput: ObservableObject {
     @Published var enabled: Bool { didSet { settingsChanged() } }
     @Published var host: String { didSet { settingsChanged() } }
     @Published var port: Int { didSet { settingsChanged() } }
-    @Published var channel: Int { didSet { settingsChanged() } }
-    @Published var template: String { didSet { settingsChanged() } }
+    /// Channels that all show the subtitles. Changes apply at once, no reconnect.
+    @Published var channels: [Int] {
+        didSet {
+            UserDefaults.standard.set(channels, forKey: Keys.channels)
+            apply()
+        }
+    }
     @Published private(set) var status: Status = .off
     /// Last error the server answered with (e.g. template not found).
     @Published private(set) var serverError: String?
 
     private enum Keys {
         static let enabled = "caspar.enabled", host = "caspar.host", port = "caspar.port"
-        static let channel = "caspar.channel", template = "caspar.template"
+        static let channels = "caspar.channels"
+        static let oldChannel = "caspar.channel"   // before there were several channels
     }
 
     private var connection: NWConnection?
     private var reconnectWork: DispatchWorkItem?
     private var desired: [String]?
-    private var testLines: [String]?
+    private var testing = false
     private var testWork: DispatchWorkItem?
-    /// What the server has: template loaded on (channel, layer), and the lines last sent.
-    private var loadedOn: Int?
-    private var sentLines: [String]?
+    /// What the server has: channels with the template loaded, and the lines last sent there.
+    private var sent: [Int: [String]] = [:]
     private var receiveBuffer = ""
 
     init() {
@@ -47,8 +54,8 @@ final class CasparOutput: ObservableObject {
         enabled = d.bool(forKey: Keys.enabled)
         host = d.string(forKey: Keys.host) ?? ""
         port = d.object(forKey: Keys.port) as? Int ?? 5250
-        channel = d.object(forKey: Keys.channel) as? Int ?? 1
-        template = d.string(forKey: Keys.template) ?? "caspardcg/subtitle"
+        channels = d.array(forKey: Keys.channels) as? [Int]
+            ?? [d.object(forKey: Keys.oldChannel) as? Int ?? 1]
         connect()
     }
 
@@ -59,24 +66,25 @@ final class CasparOutput: ObservableObject {
         apply()
     }
 
-    /// Shows a test subtitle for a few seconds (Settings).
+    /// Shows a test subtitle on every channel for a few seconds (Settings).
     func test() {
         testWork?.cancel()
-        testLines = ["CueDeck test subtitle", "Channel \(channel), layer \(Self.layer)"]
+        testing = true
         apply()
         let work = DispatchWorkItem { [weak self] in
-            self?.testLines = nil
+            self?.testing = false
             self?.apply()
         }
         testWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: work)
     }
 
-    /// Clears the layer before the app quits.
+    /// Clears the layers before the app quits.
     func shutdown() {
-        guard let conn = connection, status == .connected, let ch = loadedOn else { return }
+        guard let conn = connection, status == .connected, !sent.isEmpty else { return }
         let done = DispatchSemaphore(value: 0)
-        conn.send(content: Data("CLEAR \(ch)-\(Self.layer)\r\n".utf8), completion: .contentProcessed { _ in done.signal() })
+        let commands = sent.keys.map { "CLEAR \($0)-\(Self.layer)\r\n" }.joined()
+        conn.send(content: Data(commands.utf8), completion: .contentProcessed { _ in done.signal() })
         _ = done.wait(timeout: .now() + 0.3)
         conn.cancel()
     }
@@ -85,38 +93,37 @@ final class CasparOutput: ObservableObject {
 
     private func apply() {
         guard enabled, status == .connected else { return }
-        let want = testLines ?? desired
-        // Settings changed to another channel: clear the old one first.
-        if let ch = loadedOn, ch != channel {
+        var want: [Int: [String]] = [:]
+        for ch in Set(channels) {
+            if testing {
+                want[ch] = ["CueDeck test subtitle", "Channel \(ch), layer \(Self.layer)"]
+            } else if let lines = desired {
+                want[ch] = lines
+            }
+        }
+
+        for ch in sent.keys.sorted() where want[ch] == nil {
             send("CLEAR \(ch)-\(Self.layer)")
-            loadedOn = nil
-            sentLines = nil
+            sent[ch] = nil
         }
-        guard let lines = want else {
-            if let ch = loadedOn {
-                send("CLEAR \(ch)-\(Self.layer)")
-                loadedOn = nil
-                sentLines = nil
-            }
-            return
-        }
-        let target = "\(channel)-\(Self.layer)"
-        if loadedOn == nil {
-            send("CG \(target) ADD 0 \"\(Self.escape(template))\" 1 \"\(Self.escape(Self.json(lines)))\"")
-            loadedOn = channel
-            sentLines = lines
-            // The template loads asynchronously; show it (and send the current
-            // text again) once it is ready.
-            for delay in [0.4, 1.2, 2.5] {
-                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                    guard let self, self.loadedOn == self.channel, let current = self.sentLines else { return }
-                    self.send("CG \(target) INVOKE 0 \"show\"")
-                    self.send("CG \(target) UPDATE 0 \"\(Self.escape(Self.json(current)))\"")
+        for (ch, lines) in want.sorted(by: { $0.key < $1.key }) {
+            let target = "\(ch)-\(Self.layer)"
+            if sent[ch] == nil {
+                send("CG \(target) ADD 0 \"\(Self.escape(Self.template))\" 1 \"\(Self.escape(Self.json(lines)))\"")
+                sent[ch] = lines
+                // The template loads asynchronously; show it (and send the current
+                // text again) once it is ready.
+                for delay in [0.4, 1.2, 2.5] {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                        guard let self, let current = self.sent[ch] else { return }
+                        self.send("CG \(target) INVOKE 0 \"show\"")
+                        self.send("CG \(target) UPDATE 0 \"\(Self.escape(Self.json(current)))\"")
+                    }
                 }
+            } else if sent[ch] != lines {
+                send("CG \(target) UPDATE 0 \"\(Self.escape(Self.json(lines)))\"")
+                sent[ch] = lines
             }
-        } else if sentLines != lines {
-            send("CG \(target) UPDATE 0 \"\(Self.escape(Self.json(lines)))\"")
-            sentLines = lines
         }
     }
 
@@ -149,8 +156,6 @@ final class CasparOutput: ObservableObject {
         d.set(enabled, forKey: Keys.enabled)
         d.set(host, forKey: Keys.host)
         d.set(port, forKey: Keys.port)
-        d.set(channel, forKey: Keys.channel)
-        d.set(template, forKey: Keys.template)
         // Wait until typing stops before connecting to a new address.
         reconnectWork?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.connect() }
@@ -161,16 +166,15 @@ final class CasparOutput: ObservableObject {
     private func connect() {
         // Leave nothing on air when switching off or moving to another server.
         if let old = connection {
-            if status == .connected, let ch = loadedOn {
-                old.send(content: Data("CLEAR \(ch)-\(Self.layer)\r\n".utf8),
-                         completion: .contentProcessed { _ in old.cancel() })
+            if status == .connected, !sent.isEmpty {
+                let commands = sent.keys.map { "CLEAR \($0)-\(Self.layer)\r\n" }.joined()
+                old.send(content: Data(commands.utf8), completion: .contentProcessed { _ in old.cancel() })
             } else {
                 old.cancel()
             }
         }
         connection = nil
-        loadedOn = nil
-        sentLines = nil
+        sent = [:]
         serverError = nil
         let h = host.trimmingCharacters(in: .whitespaces)
         guard enabled, !h.isEmpty else { status = .off; return }
@@ -186,8 +190,7 @@ final class CasparOutput: ObservableObject {
                 switch state {
                 case .ready:
                     self.status = .connected
-                    self.loadedOn = nil
-                    self.sentLines = nil
+                    self.sent = [:]
                     self.receive(on: conn)
                     self.apply()
                 case .waiting(let error), .failed(let error):

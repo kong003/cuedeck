@@ -135,7 +135,6 @@ enum MediaInspector {
         }
         cue.audioTracks = infos
         cue.subtitleTracks = await subtitleTracks(of: asset, handlerNames: handlerNames)
-        if cue.subtitleTrack >= cue.subtitleTracks.count { cue.subtitleTrack = cue.subtitleTracks.isEmpty ? 0 : -1 }
     }
 
     /// Text subtitle tracks (tx3g, as in MP4/MOV) that CueDeck can read.

@@ -161,8 +161,6 @@ struct Cue: Identifiable, Codable, Equatable {
     var frameRate: Double = 0          // video frames per second, 0 = unknown / no video
     var audioTracks: [AudioTrackInfo] = []
     var subtitleTracks: [SubtitleTrackInfo] = []
-    /// Index into `subtitleTracks` sent to CasparCG, -1 = off.
-    var subtitleTrack: Int = 0
     var missing: Bool = false
 
     init(url: URL) {
@@ -170,10 +168,8 @@ struct Cue: Identifiable, Codable, Equatable {
         self.name = url.deletingPathExtension().lastPathComponent
     }
 
-    /// The subtitle track sent to CasparCG, nil = off or none.
-    var selectedSubtitles: SubtitleTrackInfo? {
-        subtitleTrack >= 0 && subtitleTrack < subtitleTracks.count ? subtitleTracks[subtitleTrack] : nil
-    }
+    /// The subtitle track sent to CasparCG: the file's first one.
+    var selectedSubtitles: SubtitleTrackInfo? { subtitleTracks.first }
 
     /// Whether playing this cue shows video.
     var playsVideo: Bool { hasVideo && !audioOnly }
@@ -293,7 +289,7 @@ struct Cue: Identifiable, Codable, Equatable {
     enum CodingKeys: String, CodingKey {
         case id, url, name, speed, volumeDB, fadeIn, fadeOut, stopFade, inPoint, outPoint,
              endAction, autoStart, audioOnly, playAlongside, routes, duration, hasVideo, videoSize, frameRate, audioTracks,
-             subtitleTracks, subtitleTrack
+             subtitleTracks
     }
 
     init(from decoder: Decoder) throws {
@@ -319,7 +315,6 @@ struct Cue: Identifiable, Codable, Equatable {
         frameRate = try c.decodeIfPresent(Double.self, forKey: .frameRate) ?? 0
         audioTracks = try c.decodeIfPresent([AudioTrackInfo].self, forKey: .audioTracks) ?? []
         subtitleTracks = try c.decodeIfPresent([SubtitleTrackInfo].self, forKey: .subtitleTracks) ?? []
-        subtitleTrack = try c.decodeIfPresent(Int.self, forKey: .subtitleTrack) ?? 0
     }
 
     func encode(to encoder: Encoder) throws {
@@ -345,7 +340,6 @@ struct Cue: Identifiable, Codable, Equatable {
         try c.encode(frameRate, forKey: .frameRate)
         try c.encode(audioTracks, forKey: .audioTracks)
         try c.encode(subtitleTracks, forKey: .subtitleTracks)
-        try c.encode(subtitleTrack, forKey: .subtitleTrack)
     }
 }
 
