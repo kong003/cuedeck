@@ -512,6 +512,81 @@ final class AACDecoder {
     }
 }
 
+// MARK: - Subtitles of streams
+
+extension SubtitleReader {
+    /// All cues of an HLS WebVTT subtitle rendition, in file time.
+    static func loadHLS(playlistURL: URL) async -> [SubtitleEntry] {
+        guard let playlist = try? await HLSMediaPlaylist.load(playlistURL) else { return [] }
+        let texts = await withTaskGroup(of: (Int, String).self) { group -> [String] in
+            for (i, s) in playlist.segments.enumerated() {
+                group.addTask {
+                    let data = (try? await StreamAudioTrack.fetch(s.url)) ?? Data()
+                    return (i, String(decoding: data, as: UTF8.self))
+                }
+            }
+            var result = [String](repeating: "", count: playlist.segments.count)
+            for await (i, text) in group { result[i] = text }
+            return result
+        }
+        var seen = Set<String>()
+        var entries: [SubtitleEntry] = []
+        for text in texts {
+            for e in parseWebVTT(text) {
+                // A cue that spans a segment border is in both segments.
+                let key = "\(Int(e.start * 1000))|\(Int(e.end * 1000))|\(e.lines.joined(separator: "\n"))"
+                if seen.insert(key).inserted { entries.append(e) }
+            }
+        }
+        return entries.sorted { $0.start < $1.start }
+    }
+
+    static func parseWebVTT(_ text: String) -> [SubtitleEntry] {
+        var offset = 0.0
+        var entries: [SubtitleEntry] = []
+        let blocks = text.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n\n")
+        for block in blocks {
+            let lines = block.components(separatedBy: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+            if let map = lines.first(where: { $0.hasPrefix("X-TIMESTAMP-MAP=") }) {
+                // LOCAL:00:00:00.000,MPEGTS:900000 -> cue times are shifted by MPEGTS/90000 - LOCAL
+                var local = 0.0, mpegts = 0.0
+                for part in map.dropFirst("X-TIMESTAMP-MAP=".count).split(separator: ",") {
+                    if part.hasPrefix("LOCAL:") { local = timecode(String(part.dropFirst(6))) ?? 0 }
+                    if part.hasPrefix("MPEGTS:") { mpegts = (Double(part.dropFirst(7)) ?? 0) / 90000 }
+                }
+                offset = mpegts - local
+            }
+            guard let timing = lines.firstIndex(where: { $0.contains("-->") }) else { continue }
+            let parts = lines[timing].components(separatedBy: "-->")
+            guard parts.count == 2,
+                  let start = timecode(parts[0].trimmingCharacters(in: .whitespaces)),
+                  let end = timecode(String(parts[1].trimmingCharacters(in: .whitespaces).split(separator: " ").first ?? ""))
+            else { continue }
+            let textLines = lines[(timing + 1)...].map(plain).filter { !$0.isEmpty }
+            if !textLines.isEmpty {
+                entries.append(SubtitleEntry(start: start + offset, end: end + offset, lines: textLines))
+            }
+        }
+        return entries
+    }
+
+    /// "01:02:03.456" or "02:03.456" in seconds.
+    private static func timecode(_ s: String) -> Double? {
+        let parts = s.split(separator: ":").map { Double($0.replacingOccurrences(of: ",", with: ".")) }
+        guard !parts.isEmpty, parts.allSatisfy({ $0 != nil }) else { return nil }
+        return parts.reduce(0) { $0 * 60 + $1! }
+    }
+
+    /// Text without WebVTT tags (<i>, <c.yellow>, …) and with entities decoded.
+    private static func plain(_ s: String) -> String {
+        var out = s.replacingOccurrences(of: "<[^>]*>", with: "", options: .regularExpression)
+        for (entity, char) in [("&lt;", "<"), ("&gt;", ">"), ("&nbsp;", " "), ("&lrm;", ""), ("&rlm;", ""), ("&amp;", "&")] {
+            out = out.replacingOccurrences(of: entity, with: char)
+        }
+        return out.trimmingCharacters(in: .whitespaces)
+    }
+}
+
 // MARK: - Small helpers
 
 /// Recently loaded stream data (playlists, init and media segments) in memory,

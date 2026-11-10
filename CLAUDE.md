@@ -63,6 +63,22 @@ mixer, one small Objective-C helper. macOS 13+, Apple Silicon.
   video (`SubtitleOverlay`, Settings › Subtitles) for setups without CasparCG.
   Subtitles come from tx3g tracks (`SubtitleReader` in
   `Media.swift`), timed by the session's `displayedFileTime`.
+- BCC Media (`BCCMedia.swift`, `BCCMediaViews.swift`, `StreamAudio.swift`):
+  device-code sign-in at login.bcc.no with the public client of the BCC
+  Media tvOS app (tokens in Application Support/CueDeck/bcc-media.json,
+  0600), GraphQL API api.brunstad.tv/query (header `X-Application: cuedeck`).
+  Episodes stream as unencrypted HLS CMAF: one audio rendition per language,
+  WebVTT subtitles. A stream cue stores only `bccEpisodeID` and the chosen
+  languages (`audioTracks[].language`); links are fetched fresh per play
+  (`PlaybackEngine.streamPlan`, cached while they last the whole cue).
+  `StreamAudioTrack` downloads the fMP4 segments, decodes AAC with
+  AVAudioConverter (sample-identical to ffmpeg) and writes into the mixer
+  voice via `StreamAudioDecoder` (a `VoiceFeeder`); video is an AVPlayer on
+  the master playlist, synced with `setRate(time:atHostTime:)` (works for HLS,
+  measured within 1 ms). Player time = media time + `playerOffset`. The next
+  stream cue is preloaded (`preloadStream`: segments into `StreamCache`,
+  buffered AVPlayer handed to the session). Streams: 1× only, no loop
+  (owner's decision).
 - `Sources/ObjCSupport`: `CDCatchException`. AVFoundation raises Objective-C
   exceptions for settings it rejects, which Swift can't catch and which kill
   the app. Wrap risky AVFoundation calls (reader outputs, `canAdd`/`add`) in it.

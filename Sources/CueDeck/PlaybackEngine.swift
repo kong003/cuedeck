@@ -16,6 +16,7 @@ struct NowPlaying: Equatable, Identifiable {
     var speed: Double
     var paused: Bool
     var stopping: Bool
+    var isStream = false
 }
 
 @MainActor
@@ -379,8 +380,14 @@ final class PlaybackEngine: NSObject, ObservableObject {
             if fallback < cue.streamLanguages.count { picked = [cue.streamLanguages[fallback]] }
         }
         cue.audioTracks = picked.enumerated().map { Self.streamSlot($0, $1) }
-        cue.subtitleTracks = master.subtitles.enumerated().map { i, r in
-            SubtitleTrackInfo(index: i, trackID: Int32(i), language: r.language, fileName: r.name)
+        // German subtitles first, then Norwegian (the first track is the one shown).
+        let rank: (HLSMaster.Rendition) -> Int = { r in
+            let l = StreamLanguage(language: r.language, name: r.name, channels: 0)
+            return l.isGerman ? 0 : (l.isNorwegian ? 1 : 2)
+        }
+        let subs = master.subtitles.enumerated().sorted { (rank($0.element), $0.offset) < (rank($1.element), $1.offset) }
+        cue.subtitleTracks = subs.enumerated().map { i, pair in
+            SubtitleTrackInfo(index: i, trackID: Int32(pair.offset), language: pair.element.language, fileName: pair.element.name)
         }
         cue.normalizeRoutes(outputChannels: routingChannels, defaults: defaultRouting)
         if let index { cues.insert(cue, at: min(max(index, 0), cues.count)) } else { cues.append(cue) }
@@ -396,6 +403,7 @@ final class PlaybackEngine: NSObject, ObservableObject {
         preload = (cue.id, fileTime, nil)
         preloadTask = Task { [weak self] in
             guard let self, let plan = try? await self.streamPlan(for: cue), !Task.isCancelled else { return }
+            if self.caspar.enabled || self.subtitlesOnVideo { self.loadStreamSubtitles(cue) }
             await withTaskGroup(of: Void.self) { group in
                 for url in plan.audio {
                     group.addTask { await StreamAudioTrack.prefetch(playlistURL: url, start: fileTime) }
@@ -444,7 +452,10 @@ final class PlaybackEngine: NSObject, ObservableObject {
     func streamPlan(for cue: Cue) async throws -> StreamPlan {
         guard let id = cue.bccEpisodeID else { throw StreamError("\(cue.name) is not a BCC Media cue.") }
         var entry = streamMasters[id]
-        if entry == nil || entry!.expires < Date().addingTimeInterval(600) {
+        // BCC Media renews its stream links regularly; a link must last the
+        // whole cue (plus a margin), or it would stop working mid-show.
+        let needed = Date().addingTimeInterval(cue.segmentDuration + 600)
+        if entry == nil || entry!.expires < needed {
             guard bcc.isSignedIn else {
                 throw StreamError("Sign in to BCC Media to play \(cue.name) (File › Add BCC Media Link…).")
             }
@@ -896,7 +907,7 @@ final class PlaybackEngine: NSObject, ObservableObject {
 
     /// Speed buttons in the transport bar; applies live.
     func changeSpeed(_ id: UUID, to speed: Double) {
-        guard var cue = findCue(id) else { return }
+        guard var cue = findCue(id), !cue.isStream else { return }
         cue.speed = (speed * 100).rounded() / 100
         updateCue(cue)
     }
@@ -940,18 +951,38 @@ final class PlaybackEngine: NSObject, ObservableObject {
         }
         var lines: [String]?
         var onVideo = false
-        if let s = candidate, let cue = findCue(s.cue.id), !cue.isStream, let track = cue.selectedSubtitles {
+        if let s = candidate, let cue = findCue(s.cue.id), let track = cue.selectedSubtitles {
             onVideo = cue.playsVideo
-            let key = "\(cue.url.path)|\(track.trackID)"
+            let key = subtitleKey(cue, track)
             if let entries = subtitleCache[key], s.state != .preparing {
                 lines = SubtitleReader.entry(at: s.displayedFileTime, in: entries)?.lines ?? []
             } else {
-                loadSubtitles(url: cue.url, trackID: track.trackID, key: key)
+                if cue.isStream { loadStreamSubtitles(cue) } else { loadSubtitles(url: cue.url, trackID: track.trackID, key: key) }
                 lines = []             // CasparCG loads the template now, ready for the first line
             }
         }
         if caspar.enabled { caspar.update(lines) }
         video.setSubtitle(subtitlesOnVideo && onVideo ? lines : nil)
+    }
+
+    private func subtitleKey(_ cue: Cue, _ track: SubtitleTrackInfo) -> String {
+        cue.isStream ? "bcc|\(cue.bccEpisodeID ?? "")|\(track.language)" : "\(cue.url.path)|\(track.trackID)"
+    }
+
+    /// WebVTT subtitles of a BCC Media cue (its first subtitle language).
+    private func loadStreamSubtitles(_ cue: Cue) {
+        guard let track = cue.selectedSubtitles else { return }
+        let key = subtitleKey(cue, track)
+        guard subtitleCache[key] == nil, !subtitlesLoading.contains(key) else { return }
+        subtitlesLoading.insert(key)
+        Task {
+            defer { subtitlesLoading.remove(key) }
+            guard let plan = try? await streamPlan(for: cue),
+                  let rendition = plan.subtitles.first(where: { $0.language == track.language })
+                    ?? (Int(track.trackID) < plan.subtitles.count ? plan.subtitles[Int(track.trackID)] : nil)
+            else { return }
+            subtitleCache[key] = await SubtitleReader.loadHLS(playlistURL: rendition.url)
+        }
     }
 
     private func loadSubtitles(url: URL, trackID: Int32, key: String) {
@@ -975,7 +1006,8 @@ final class PlaybackEngine: NSObject, ObservableObject {
                               remaining: s.remaining,
                               progress: s.duration > 0 ? t / s.duration : 0,
                               speed: s.speed,
-                              paused: s.state == .paused, stopping: s.state == .stopping)
+                              paused: s.state == .paused, stopping: s.state == .stopping,
+                              isStream: s.cue.isStream)
         }
         if list != playing { playing = list }
 

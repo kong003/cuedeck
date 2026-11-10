@@ -60,22 +60,25 @@ struct CueInspector: View {
             }
 
             Section {
-                LabeledContent("Speed") {
-                    HStack {
-                        Slider(value: $cue.speed, in: 0.25...4.0)
-                            .help("Speed from 0.25× to 4×, the pitch stays the same")
-                        NumberField(value: $cue.speed, digits: 2, width: 56)
-                            .help("Type the speed and press Return")
-                        Text("×")
+                // BCC Media streams always play at 1× and don't loop.
+                if !cue.isStream {
+                    LabeledContent("Speed") {
+                        HStack {
+                            Slider(value: $cue.speed, in: 0.25...4.0)
+                                .help("Speed from 0.25× to 4×, the pitch stays the same")
+                            NumberField(value: $cue.speed, digits: 2, width: 56)
+                                .help("Type the speed and press Return")
+                            Text("×")
+                        }
                     }
-                }
-                FlowLayout(spacing: 6, lineSpacing: 6) {
-                    ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { s in
-                        Button(String(format: "%g×", s)) { cue.speed = s }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                            .tint(cue.speed == s ? Color.accentColor : nil)
-                            .help("Set the speed to \(String(format: "%g", s))×")
+                    FlowLayout(spacing: 6, lineSpacing: 6) {
+                        ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { s in
+                            Button(String(format: "%g×", s)) { cue.speed = s }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                                .tint(cue.speed == s ? Color.accentColor : nil)
+                                .help("Set the speed to \(String(format: "%g", s))×")
+                        }
                     }
                 }
                 LabeledContent("Volume") {
@@ -103,10 +106,12 @@ struct CueInspector: View {
                     Toggle("Audio only (no video output)", isOn: $cue.audioOnly)
                         .help("Play only the audio of this file. Applies the next time the cue starts.")
                 }
-                Picker("When finished", selection: $cue.endAction) {
-                    ForEach(EndAction.selectable) { Text($0.label).tag($0) }
+                if !cue.isStream {
+                    Picker("When finished", selection: $cue.endAction) {
+                        ForEach(EndAction.selectable) { Text($0.label).tag($0) }
+                    }
+                    .help("Stop at the end, or loop seamlessly until stopped")
                 }
-                .help("Stop at the end, or loop seamlessly until stopped")
                 LabeledContent("Plays for", value: cue.endAction == .loop ? "Until stopped" : formatTime(cue.playDuration))
             } header: {
                 Text("Playback")

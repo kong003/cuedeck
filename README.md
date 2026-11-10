@@ -93,6 +93,24 @@ Without the script: drag CueDeck into Applications, then run
 
 The cue list is also autosaved and restored on the next launch.
 
+## BCC Media episodes
+
+Episodes from app.bcc.media play straight from the internet, with every
+audio language routable like the streams of a file, and their subtitles.
+
+1. File › Add BCC Media Link… (⇧⌘L) or the *BCC Media* button under the cue
+   list. The first time, *Sign In…* shows a code: open the sign-in page (on
+   this Mac or your phone), sign in with your BCC account and confirm the
+   code. CueDeck never sees your password.
+2. Paste the episode link, e.g. `https://app.bcc.media/episode/3075`.
+3. The cue gets two streams, German and Norwegian (only one if the episode
+   has just one of them). Pick another language in a stream's menu, add
+   streams with **+**, route each to its outputs.
+
+The next BCC Media cue is loaded ahead (first audio segments, video
+buffered), so GO starts at once. The Mac needs internet during the show.
+BCC Media cues play at 1× and don't loop.
+
 ## Subtitles
 
 Without CasparCG: turn on *Show subtitles in the video output* in

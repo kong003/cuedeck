@@ -363,8 +363,11 @@ struct NowPlayingRow: View {
                 // Drops the speed controls, then the elapsed time, when space runs out.
                 // The remaining time is always shown on one line.
                 ViewThatFits(in: .horizontal) {
-                    HStack(spacing: 10) { speedControls; times(elapsed: true) }
-                    HStack(spacing: 10) { speedControls; times(elapsed: false) }
+                    if !np.isStream {          // BCC Media streams play at 1×
+                        HStack(spacing: 10) { speedControls; times(elapsed: true) }
+                        HStack(spacing: 10) { speedControls; times(elapsed: false) }
+                    }
+                    times(elapsed: true)
                     times(elapsed: false)
                 }
 
