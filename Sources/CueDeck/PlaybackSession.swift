@@ -1,7 +1,11 @@
 import AVFoundation
 import CMixer
 import Foundation
+import OSLog
 import QuartzCore
+
+/// Diagnostics of stream playback (Console.app, subsystem "CueDeck").
+let streamLog = Logger(subsystem: "CueDeck", category: "stream")
 
 /// Serial queue for releasing audio resources. Voices are released here and
 /// audio outputs are disposed here too, so an output is never destroyed while
@@ -199,18 +203,11 @@ final class PlaybackSession: Identifiable {
     private func prepareLive(_ plan: StreamPlan) async throws {
         let start = try await LiveStartPoint.find(master: plan.master)
         if isCancelled { return }
-        liveStart = start
         playerOffset = 0
         mediaDuration = cue.segmentDuration          // "endless": the cue's long nominal length
         pausedMedia = 0
         anchorMedia = 0
-        if output != nil, !plan.audio.isEmpty {
-            let made = try await makeStreamVoice(atMedia: 0, prefillSeconds: 1.0, ramp: 0)
-            voice = made.voice
-            decoder = made.decoder
-            voiceSpeed = 1
-            if isCancelled { return }
-        }
+        var audioStart = start
         if cue.playsVideo {
             let proxy = LiveHLSProxy(masterURL: plan.masterURL, startSequence: start.sequence,
                                      refresh: plan.refreshMaster ?? { nil })
@@ -218,7 +215,31 @@ final class PlaybackSession: Identifiable {
             let item = AVPlayerItem(asset: proxy.makeAsset())
             item.preferredForwardBufferDuration = 12
             try await attachPlayer(item, begin: 0)
+            if isCancelled { return }
+            // The player picks its own live position and buffers from there (often a
+            // segment after the playlist start). Start there, and the sound with it:
+            // asking it to play anything not buffered would leave it standing still.
+            if let p = player, let item = p.currentItem {
+                var t = p.currentTime().seconds
+                if let first = item.loadedTimeRanges.first?.timeRangeValue, first.start.seconds.isFinite,
+                   !(t.isFinite && t >= first.start.seconds && t < (first.start + first.duration).seconds) {
+                    t = first.start.seconds
+                }
+                if t.isFinite, t > 0 {
+                    playerOffset = t
+                    audioStart = start.advanced(by: t)
+                }
+            }
         }
+        liveStart = audioStart
+        if output != nil, !plan.audio.isEmpty {
+            let made = try await makeStreamVoice(atMedia: 0, prefillSeconds: 1.0, ramp: 0)
+            voice = made.voice
+            decoder = made.decoder
+            voiceSpeed = 1
+            if isCancelled { return }
+        }
+        streamLog.notice("live start: sequence \(audioStart.sequence, privacy: .public), player time \(String(format: "%.2f", self.playerOffset), privacy: .public)")
     }
 
     /// Muted AVPlayer for `item` on the audio device clock, at media time
@@ -766,7 +787,49 @@ final class PlaybackSession: Identifiable {
 
     // MARK: - Per-frame update (called by the engine at 60 Hz)
 
+    private var lastStreamLog: CFTimeInterval = 0
+    private var lastResync: CFTimeInterval = 0
+
+    /// Streams: if the video player stopped while the cue plays (e.g. after a
+    /// network hiccup), start it again at the current position, in sync.
+    private func keepStreamVideoRunning() {
+        guard cue.isStream, state == .playing, !seeking, !videoEnded, let p = player,
+              p.currentItem?.status == .readyToPlay, p.rate == 0,
+              HostClock.now() > firstStartHost &+ HostClock.ticks(seconds: 1) else { return }
+        let now = CACurrentMediaTime()
+        guard now - lastResync > 2 else { return }
+        lastResync = now
+        let host = HostClock.now() + HostClock.ticks(seconds: 0.1)
+        let m = mediaTime + 0.1
+        p.setRate(1, time: playerTime(m), atHostTime: HostClock.cmTime(host))
+        streamLog.notice("video stopped, restarted at media \(String(format: "%.2f", m), privacy: .public)")
+    }
+
+    /// Every 2 s while a stream plays: the video player's state, for diagnosing
+    /// problems on other Macs (log show --predicate 'subsystem == "CueDeck"').
+    private func logStreamState() {
+        guard cue.isStream, let p = player, let item = p.currentItem else { return }
+        let now = CACurrentMediaTime()
+        guard now - lastStreamLog >= 2 else { return }
+        lastStreamLog = now
+        let loaded = item.loadedTimeRanges.map {
+            String(format: "%.1f-%.1f", $0.timeRangeValue.start.seconds, ($0.timeRangeValue.start + $0.timeRangeValue.duration).seconds)
+        }.joined(separator: ",")
+        let ev = item.accessLog()?.events.last
+        let layer = playerLayer.map { String(format: "layer opacity %.2f ready %d frame %.0fx%.0f",
+                                             $0.presentation()?.opacity ?? $0.opacity, $0.isReadyForDisplay ? 1 : 0,
+                                             $0.bounds.width, $0.bounds.height) } ?? "no layer"
+        streamLog.notice("""
+            \(self.cue.name, privacy: .public) state \(String(describing: self.state), privacy: .public)             media \(String(format: "%.2f", self.mediaTime), privacy: .public)             player \(String(format: "%.2f", p.currentTime().seconds), privacy: .public) rate \(p.rate, privacy: .public)             control \(p.timeControlStatus.rawValue, privacy: .public) wait \(p.reasonForWaitingToPlay?.rawValue ?? "-", privacy: .public)             item \(item.status.rawValue, privacy: .public) \(item.error?.localizedDescription ?? "", privacy: .public)             loaded \(loaded, privacy: .public) bitrate \(Int((ev?.indicatedBitrate ?? 0) / 1000), privacy: .public)k             observed \(Int((ev?.observedBitrate ?? 0) / 1000), privacy: .public)k stalls \(ev?.numberOfStalls ?? 0, privacy: .public)             dropped \(ev?.numberOfDroppedVideoFrames ?? 0, privacy: .public) \(layer, privacy: .public)
+            """)
+        for e in item.errorLog()?.events.suffix(2) ?? [] {
+            streamLog.error("stream error \(e.errorStatusCode, privacy: .public) \(e.errorComment ?? "", privacy: .public)")
+        }
+    }
+
     func tick() {
+        logStreamState()
+        keepStreamVideoRunning()
         guard state == .playing || state == .stopping else { return }
 
         let started = HostClock.now() >= firstStartHost

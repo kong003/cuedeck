@@ -18,6 +18,10 @@ struct CueDeckApp: App {
             SettingsView()
                 .environmentObject(engine)
         }
+        Window("CueDeck Help", id: "help") {
+            HelpView()
+        }
+        .commands { HelpCommands() }
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("New Show") { engine.newShow() }
@@ -113,8 +117,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return event
         }
         if NSApp.keyWindow?.isSheet == true || NSApp.keyWindow?.attachedSheet != nil { return event }
-        // Never GO or delete cues from the Settings window.
+        // Never GO or delete cues from the Settings or Help window.
         if NSApp.keyWindow?.identifier?.rawValue.localizedCaseInsensitiveContains("settings") == true { return event }
+        if NSApp.keyWindow?.title == "CueDeck Help" { return event }
         let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
             .subtracting([.capsLock, .numericPad, .function])
         let engine = PlaybackEngine.shared

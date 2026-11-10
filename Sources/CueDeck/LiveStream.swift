@@ -36,6 +36,15 @@ extension BCCMedia {
 struct LiveStartPoint {
     var sequence: Int
     var time: Double
+    var segmentDuration: Double = 6
+
+    /// The point `seconds` later on the stream timeline (segments are contiguous).
+    func advanced(by seconds: Double) -> LiveStartPoint {
+        var p = self
+        p.sequence += Int((seconds + 0.001) / max(segmentDuration, 0.5))
+        p.time += seconds
+        return p
+    }
 
     /// `segmentsBehind` segments before the newest one (like other players, so
     /// there is always something buffered).
@@ -54,7 +63,8 @@ struct LiveStartPoint {
         let data = try await StreamAudioTrack.fetch(segment.url, cached: true)
         guard let base = decodeTime(data) else { throw StreamError("Can't read the livestream's timing.") }
         _ = last
-        return LiveStartPoint(sequence: segment.sequence, time: Double(base) / Double(timescale))
+        return LiveStartPoint(sequence: segment.sequence, time: Double(base) / Double(timescale),
+                              segmentDuration: segment.duration)
     }
 
     /// mdhd timescale of an init segment.
