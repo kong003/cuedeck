@@ -7,7 +7,9 @@ struct SettingsView: View {
             DefaultRoutingSettings()
                 .tabItem { Label("Audio Routing", systemImage: "hifispeaker.2") }
             CasparSettings()
-                .tabItem { Label("CasparCG", systemImage: "captions.bubble") }
+                .tabItem { Label("Subtitles", systemImage: "captions.bubble") }
+            BCCSettings()
+                .tabItem { Label("BCC Media", systemImage: "globe") }
         }
         .frame(width: 520, height: 560)
     }
@@ -68,11 +70,12 @@ struct DefaultRoutingSettings: View {
 /// Where subtitles of playing cues are sent.
 struct CasparSettings: View {
     @EnvironmentObject var engine: PlaybackEngine
-    var body: some View { CasparSettingsForm(caspar: engine.caspar) }
+    var body: some View { CasparSettingsForm(caspar: engine.caspar, onVideo: $engine.subtitlesOnVideo) }
 }
 
 private struct CasparSettingsForm: View {
     @ObservedObject var caspar: CasparOutput
+    @Binding var onVideo: Bool
 
     private var statusText: (String, Color) {
         switch caspar.status {
@@ -85,6 +88,16 @@ private struct CasparSettingsForm: View {
 
     var body: some View {
         Form {
+            Section {
+                Toggle("Show subtitles in the video output", isOn: $onVideo)
+                    .help("Draws the subtitles over the video on the output display, for setups without CasparCG")
+            } header: {
+                Text("Video output")
+            } footer: {
+                Text("Subtitles embedded in MP4 or MOV files (the first subtitle track) appear at the bottom of the video, in time with the cue.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
             Section {
                 Toggle("Send subtitles to CasparCG", isOn: $caspar.enabled)
                     .help("Subtitles embedded in a video play on the CasparCG server while the cue plays")

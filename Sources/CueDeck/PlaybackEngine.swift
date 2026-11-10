@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import CMixer
 import Combine
 import Foundation
 import UniformTypeIdentifiers
@@ -100,8 +101,16 @@ final class PlaybackEngine: NSObject, ObservableObject {
     @Published var message: String?
 
     let video = VideoOutput()
-    /// Subtitles to CasparCG (Settings › CasparCG).
+    /// Subtitles to CasparCG (Settings › Subtitles).
     let caspar = CasparOutput()
+    /// BCC Media sign-in (File › Add BCC Media Link…, Settings › BCC Media).
+    let bcc = BCCMediaAccount()
+    /// Shows the "Add BCC Media Link" sheet.
+    @Published var showBCCSheet = false
+    /// Draw subtitles over the video output (for setups without CasparCG).
+    @Published var subtitlesOnVideo: Bool = UserDefaults.standard.bool(forKey: "subtitlesOnVideo") {
+        didSet { UserDefaults.standard.set(subtitlesOnVideo, forKey: "subtitlesOnVideo") }
+    }
     /// Subtitles read from files, by "path|trackID".
     private var subtitleCache: [String: [SubtitleEntry]] = [:]
     private var subtitlesLoading: Set<String> = []
@@ -328,6 +337,89 @@ final class PlaybackEngine: NSObject, ObservableObject {
         for s in sessions where s.cue.id == cue.id && s.state != .finished { s.update(cue: cue) }
     }
 
+    /// Adds a BCC Media episode (link from app.bcc.media) as a cue that plays
+    /// from the internet, with all its audio languages as streams and its subtitles.
+    func addBCCEpisode(link: String, at index: Int? = nil) async throws {
+        guard let id = BCCMedia.episodeID(from: link) else {
+            throw BCCMedia.APIError(message: "This is not a link to a BCC Media episode (app.bcc.media/episode/…).")
+        }
+        let token = try await bcc.accessToken()
+        let episode = try await BCCMedia.episode(id: id, token: token)
+        let master = try await HLSMaster.load(episode.streamURL)
+
+        var cue = Cue(url: BCCMedia.link(forEpisode: episode.id))
+        cue.name = episode.title
+        cue.bccEpisodeID = episode.id
+        cue.duration = episode.duration
+        if let best = master.variants.max(by: { $0.height < $1.height }) {
+            cue.hasVideo = true
+            cue.videoSize = best.width > 0 ? "\(best.width)×\(best.height)" : "Video"
+            cue.frameRate = best.frameRate
+            if best.frameRate > 0 { cue.videoSize += String(format: " · %g fps", (best.frameRate * 100).rounded() / 100) }
+        }
+        cue.streamLanguages = master.audio.map { StreamLanguage(language: $0.language, name: $0.name, channels: $0.channels) }
+        // Two streams by default: German and Norwegian (only one of them if the
+        // other is missing); without either, the episode's default language.
+        var picked = [cue.streamLanguages.first(where: \.isGerman), cue.streamLanguages.first(where: \.isNorwegian)]
+            .compactMap { $0 }
+        if picked.isEmpty {
+            let fallback = master.audio.firstIndex(where: \.isDefault) ?? 0
+            if fallback < cue.streamLanguages.count { picked = [cue.streamLanguages[fallback]] }
+        }
+        cue.audioTracks = picked.enumerated().map { Self.streamSlot($0, $1) }
+        cue.subtitleTracks = master.subtitles.enumerated().map { i, r in
+            SubtitleTrackInfo(index: i, trackID: Int32(i), language: r.language, fileName: r.name)
+        }
+        cue.normalizeRoutes(outputChannels: routingChannels, defaults: defaultRouting)
+        if let index { cues.insert(cue, at: min(max(index, 0), cues.count)) } else { cues.append(cue) }
+        selection = cue.id
+    }
+
+    private static func streamSlot(_ index: Int, _ l: StreamLanguage) -> AudioTrackInfo {
+        var info = AudioTrackInfo(index: index, channels: l.channels,
+                                  label: "Stream \(index + 1) · \(l.channels) ch · \(l.language)")
+        info.fileName = l.name
+        info.language = l.language
+        return info
+    }
+
+    /// BCC Media cue: which language a stream plays. Keeps its outputs.
+    func setStreamLanguage(cueID: UUID, stream: Int, language: String) {
+        guard !showMode, var cue = findCue(cueID), stream < cue.audioTracks.count,
+              let l = cue.streamLanguages.first(where: { $0.language == language }) else { return }
+        let start = cue.blockStart(ofTrack: stream) ?? cue.routes[stream].first ?? -1
+        cue.audioTracks[stream] = Self.streamSlot(stream, l)
+        cue.setBlock(track: stream, start: start, outputChannels: routingChannels)
+        updateCue(cue)
+    }
+
+    /// BCC Media cue: one more stream, with the next language not in use yet,
+    /// on the outputs after the ones already used.
+    func addStream(cueID: UUID) {
+        guard !showMode, var cue = findCue(cueID), cue.audioTracks.count < min(Int(CM_MAX_TRACKS), cue.streamLanguages.count),
+              let l = cue.streamLanguages.first(where: { l in !cue.audioTracks.contains { $0.language == l.language } })
+        else { return }
+        let index = cue.audioTracks.count
+        cue.audioTracks.append(Self.streamSlot(index, l))
+        while cue.routes.count < index + 1 { cue.routes.append([]) }
+        let next = (cue.routes.flatMap { $0 }.max() ?? -1) + 1
+        cue.setBlock(track: index, start: next + l.channels <= routingChannels ? next : -1, outputChannels: routingChannels)
+        updateCue(cue)
+    }
+
+    func removeStream(cueID: UUID, stream: Int) {
+        guard !showMode, var cue = findCue(cueID), cue.audioTracks.count > 1, stream < cue.audioTracks.count else { return }
+        cue.audioTracks.remove(at: stream)
+        if stream < cue.routes.count { cue.routes.remove(at: stream) }
+        cue.audioTracks = cue.audioTracks.enumerated().map { i, t in
+            var t = t
+            t.index = i
+            t.label = "Stream \(i + 1) · \(t.channels) ch · \(t.language)"
+            return t
+        }
+        updateCue(cue)
+    }
+
     /// Adds files to the list, at `index` (where they were dropped) or at the end.
     func addFiles(_ urls: [URL], selectAdded: Bool = false, at index: Int? = nil) {
         Task {
@@ -495,7 +587,7 @@ final class PlaybackEngine: NSObject, ObservableObject {
     }
 
     func reinspect(_ id: UUID) {
-        guard let original = findCue(id) else { return }
+        guard let original = findCue(id), !original.isStream else { return }
         Task {
             var cue = original
             do {
@@ -556,6 +648,10 @@ final class PlaybackEngine: NSObject, ObservableObject {
     private func start(_ group: [Cue], at hostTime: UInt64?, stopOthers: Bool) {
         var ready: [(session: PlaybackSession, media: Double)] = []
         for cue in group {
+            if cue.isStream {
+                message = "\(cue.name): playing BCC Media cues comes in the next update."
+                continue
+            }
             if cue.missing || !FileManager.default.fileExists(atPath: cue.url.path) {
                 message = "File not found: \(cue.url.path)"
                 continue
@@ -741,22 +837,28 @@ final class PlaybackEngine: NSObject, ObservableObject {
 
     /// Sends the subtitle of the newest playing cue that has subtitles.
     private func updateSubtitles() {
-        guard caspar.enabled else { return }
+        guard caspar.enabled || subtitlesOnVideo else {
+            video.setSubtitle(nil)
+            return
+        }
         let candidate = sessions.last { s in
             (s.state == .preparing || s.state == .playing || s.state == .paused)
                 && findCue(s.cue.id)?.selectedSubtitles != nil
         }
-        guard let s = candidate, let cue = findCue(s.cue.id), let track = cue.selectedSubtitles else {
-            caspar.update(nil)
-            return
+        var lines: [String]?
+        var onVideo = false
+        if let s = candidate, let cue = findCue(s.cue.id), !cue.isStream, let track = cue.selectedSubtitles {
+            onVideo = cue.playsVideo
+            let key = "\(cue.url.path)|\(track.trackID)"
+            if let entries = subtitleCache[key], s.state != .preparing {
+                lines = SubtitleReader.entry(at: s.displayedFileTime, in: entries)?.lines ?? []
+            } else {
+                loadSubtitles(url: cue.url, trackID: track.trackID, key: key)
+                lines = []             // CasparCG loads the template now, ready for the first line
+            }
         }
-        let key = "\(cue.url.path)|\(track.trackID)"
-        guard let entries = subtitleCache[key], s.state != .preparing else {
-            loadSubtitles(url: cue.url, trackID: track.trackID, key: key)
-            caspar.update([])          // load the template now, so it is ready for the first line
-            return
-        }
-        caspar.update(SubtitleReader.entry(at: s.displayedFileTime, in: entries)?.lines ?? [])
+        if caspar.enabled { caspar.update(lines) }
+        video.setSubtitle(subtitlesOnVideo && onVideo ? lines : nil)
     }
 
     private func loadSubtitles(url: URL, trackID: Int32, key: String) {
@@ -841,7 +943,7 @@ final class PlaybackEngine: NSObject, ObservableObject {
     private func loadShow(_ show: ShowFile) {
         var loaded = show.cues
         for i in loaded.indices {
-            loaded[i].missing = !FileManager.default.fileExists(atPath: loaded[i].url.path)
+            loaded[i].missing = !loaded[i].isStream && !FileManager.default.fileExists(atPath: loaded[i].url.path)
             loaded[i].normalizeRoutes(outputChannels: routingChannels, defaults: defaultRouting)
             // Older shows: "play next cue when finished" is now the next cue's autostart.
             if loaded[i].endAction == .next {
@@ -859,7 +961,7 @@ final class PlaybackEngine: NSObject, ObservableObject {
     /// Reads the stream names from the files again (shows saved before
     /// CueDeck read them, or files that changed).
     private func refreshStreamNames() {
-        let list = cues.filter { !$0.missing && $0.duration > 0 }.map { ($0.id, $0.url) }
+        let list = cues.filter { !$0.missing && !$0.isStream && $0.duration > 0 }.map { ($0.id, $0.url) }
         Task {
             for (id, url) in list {
                 let names = await MediaInspector.trackNames(of: url)

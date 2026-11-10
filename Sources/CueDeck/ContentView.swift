@@ -71,6 +71,9 @@ struct ContentView: View {
         .frame(minWidth: hideInspector ? 600 : 1000, minHeight: hideBottom ? (engine.showMode ? 200 : 420) : 620)
         .background(WindowLevel(floating: keepInFront))
         // The show file's name, and whether the list is kept in a file.
+        .sheet(isPresented: $engine.showBCCSheet) {
+            BCCLinkSheet(account: engine.bcc).environmentObject(engine)
+        }
         .navigationTitle(engine.showURL?.deletingPathExtension().lastPathComponent ?? "Untitled Show")
         .navigationSubtitle(engine.showURL == nil
                             ? "Not saved as a file yet (⌘S)"
@@ -436,7 +439,11 @@ struct CueListView: View {
                             if !cue.audioTracks.isEmpty && !engine.showMode {
                                 Button("Apply Default Routing") { engine.resetRoutes(for: cue.id) }
                             }
-                            Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([cue.url]) }
+                            if cue.isStream {
+                                Button("Open in BCC Media") { NSWorkspace.shared.open(cue.url) }
+                            } else {
+                                Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([cue.url]) }
+                            }
                             Divider()
                             if engine.showMode {
                                 // No deleting during the show.
@@ -507,6 +514,8 @@ struct CueListView: View {
             HStack {
                 Button { engine.addFilesWithPanel() } label: { Label("Add Media", systemImage: "plus") }
                     .help("Add video or audio files to the cue list (⌘I). You can also drop files here.")
+                Button { engine.showBCCSheet = true } label: { Label("BCC Media", systemImage: "globe") }
+                    .help("Add an episode from app.bcc.media by its link (⇧⌘L)")
                 Button { engine.removeSelected() } label: {
                     Label(engine.selectedIDs.count > 1 ? "Delete \(engine.selectedIDs.count)" : "Delete", systemImage: "minus")
                 }
@@ -589,7 +598,7 @@ struct CueRow: View {
                     .foregroundStyle(isNext ? Color.green : Color.secondary)
             }
             .frame(width: 40, alignment: .trailing)
-            Image(systemName: cue.playsVideo ? "film" : "waveform")
+            Image(systemName: cue.isStream ? "globe" : (cue.playsVideo ? "film" : "waveform"))
                 .frame(width: 18)
             VStack(alignment: .leading, spacing: 4) {
                 // Line 1: name, and the time on the right.
@@ -619,6 +628,13 @@ struct CueRow: View {
                         StreamRouteMenu(cue: cue, track: track, compact: true)
                             .font(.caption)
                             .disabled(engine.showMode)
+                    }
+                    if cue.isStream && cue.audioTracks.count < cue.streamLanguages.count {
+                        Button { engine.addStream(cueID: cue.id) } label: { Image(systemName: "plus") }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(engine.showMode)
+                            .help("Add a stream with another language")
                     }
                     if cue.hasVideo {
                         Toggle("Audio only", isOn: Binding(

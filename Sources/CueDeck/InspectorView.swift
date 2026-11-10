@@ -47,9 +47,9 @@ struct CueInspector: View {
             Section("Media") {
                 TextField("Name", text: $cue.name)
                 LabeledContent("File") {
-                    Text(cue.url.lastPathComponent)
+                    Text(cue.isStream ? "BCC Media · episode \(cue.bccEpisodeID ?? "")" : cue.url.lastPathComponent)
                         .lineLimit(1).truncationMode(.middle)
-                        .help(cue.url.path)
+                        .help(cue.isStream ? cue.url.absoluteString : cue.url.path)
                 }
                 LabeledContent("Duration", value: formatTime(cue.duration))
                 LabeledContent("Video", value: cue.hasVideo ? (cue.videoSize.isEmpty ? "Yes" : cue.videoSize) : "None")
@@ -179,6 +179,17 @@ struct StreamRouteMenu: View {
 
     var body: some View {
         Menu {
+            if cue.isStream && !cue.streamLanguages.isEmpty {
+                // BCC Media: pick the language of this stream.
+                Section("Language") {
+                    ForEach(cue.streamLanguages) { l in
+                        item(l.name.isEmpty ? l.language : l.name, selected: track.language == l.language) {
+                            engine.setStreamLanguage(cueID: cue.id, stream: track.index, language: l.language)
+                        }
+                    }
+                }
+                Divider()
+            }
             item("Off", selected: cue.blockStart(ofTrack: track.index) == -1) { set(-1) }
             Divider()
             ForEach(Array(stride(from: 0, to: max(outputs - width + 1, 1), by: width)), id: \.self) { s in
@@ -195,6 +206,12 @@ struct StreamRouteMenu: View {
                     }
                 }
             }
+            if cue.isStream && cue.audioTracks.count > 1 {
+                Divider()
+                Button("Remove Stream \(track.index + 1)", role: .destructive) {
+                    engine.removeStream(cueID: cue.id, stream: track.index)
+                }
+            }
         } label: {
             Text(compact ? "\(track.displayName) → \(currentLabel)" : currentLabel)
                 .lineLimit(1)
@@ -203,7 +220,8 @@ struct StreamRouteMenu: View {
         .buttonStyle(.bordered)
         .controlSize(.small)
         .fixedSize()
-        .help("Choose which outputs \(track.displayName) plays on")
+        .help(cue.isStream ? "Choose the language of this stream and its outputs"
+                           : "Choose which outputs \(track.displayName) plays on")
     }
 
     @ViewBuilder

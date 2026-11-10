@@ -59,7 +59,9 @@ mixer, one small Objective-C helper. macOS 13+, Apple Silicon.
   `caspardcg/subtitle` is fixed, a cue always uses its first subtitle track). Only
   changes are sent, everything is re-sent after a reconnect. Template `template/caspardcg/subtitle.html`
   (webcg): data `{"step":{"0":{"lines":[…]}}}`, shown with `CG INVOKE "show"`.
-  Layer fixed at 20. Subtitles come from tx3g tracks (`SubtitleReader` in
+  Layer fixed at 20. `VideoOutput.setSubtitle` draws the same lines over the
+  video (`SubtitleOverlay`, Settings › Subtitles) for setups without CasparCG.
+  Subtitles come from tx3g tracks (`SubtitleReader` in
   `Media.swift`), timed by the session's `displayedFileTime`.
 - `Sources/ObjCSupport`: `CDCatchException`. AVFoundation raises Objective-C
   exceptions for settings it rejects, which Swift can't catch and which kill

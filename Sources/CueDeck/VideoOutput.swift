@@ -51,6 +51,8 @@ private final class OutputView: NSView {
 final class VideoOutput {
     private var window: OutputWindow?
     private var layers: [AVPlayerLayer] = []
+    private var subtitleView: SubtitleOverlay?
+    private var subtitleLines: [String]?
     private(set) var displayID: CGDirectDisplayID?
 
     var isOpen: Bool { window != nil }
@@ -93,12 +95,20 @@ final class VideoOutput {
         if layers.isEmpty { close() }
     }
 
+    /// Subtitle drawn over the video (Settings › Subtitles), nil or [] = none.
+    func setSubtitle(_ lines: [String]?) {
+        guard lines != subtitleLines else { return }
+        subtitleLines = lines
+        subtitleView?.show(lines ?? [])
+    }
+
     func close() {
         layers.forEach { $0.removeFromSuperlayer() }
         layers.removeAll()
         window?.orderOut(nil)
         window?.close()
         window = nil
+        subtitleView = nil
     }
 
     /// Call when displays are added or removed.
@@ -131,7 +141,62 @@ final class VideoOutput {
         view.layer?.backgroundColor = NSColor.black.cgColor
         view.autoresizingMask = [.width, .height]
         w.contentView = view
+
+        let overlay = SubtitleOverlay(frame: view.bounds)
+        overlay.autoresizingMask = [.width, .height]
+        view.addSubview(overlay)
+        overlay.show(subtitleLines ?? [])
+        subtitleView = overlay
+
         window = w
         return w
+    }
+}
+
+/// Subtitles over the video, like the CasparCG template: white text on a
+/// translucent box, centred near the bottom, sized to the output display.
+final class SubtitleOverlay: NSView {
+    private let box = NSView()
+    private let label = NSTextField(wrappingLabelWithString: "")
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.zPosition = 1000               // above the player layers
+        box.wantsLayer = true
+        box.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.4).cgColor
+        label.textColor = .white
+        label.alignment = .center
+        label.maximumNumberOfLines = 0
+        label.isSelectable = false
+        box.addSubview(label)
+        addSubview(box)
+        box.isHidden = true
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    func show(_ lines: [String]) {
+        label.stringValue = lines.joined(separator: "\n")
+        box.isHidden = lines.isEmpty
+        needsLayout = true
+    }
+
+    override func layout() {
+        super.layout()
+        let h = bounds.height
+        let fontSize = max(14, h * 0.045)
+        label.font = .systemFont(ofSize: fontSize, weight: .medium)
+        let padX = fontSize * 0.6, padY = fontSize * 0.3
+        let maxWidth = bounds.width * 0.9 - 2 * padX
+        label.preferredMaxLayoutWidth = maxWidth
+        let size = label.sizeThatFits(NSSize(width: maxWidth, height: .greatestFiniteMagnitude))
+        let w = min(size.width, maxWidth) + 2 * padX
+        let bh = size.height + 2 * padY
+        box.frame = NSRect(x: (bounds.width - w) / 2, y: h * 0.05, width: w, height: bh)
+        label.frame = NSRect(x: padX, y: padY, width: w - 2 * padX, height: size.height)
+        box.layer?.cornerRadius = fontSize * 0.3
     }
 }

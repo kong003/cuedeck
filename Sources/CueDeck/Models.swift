@@ -57,6 +57,8 @@ struct AudioTrackInfo: Codable, Equatable, Identifiable {
     var name: String = ""   // user-given name, empty = use label
     var fileName: String = "" // name stored in the media file, if any
     var channelNames: [String] = []
+    /// For BCC Media cues: the language this stream plays (ISO code, e.g. "deu").
+    var language: String = ""
     var id: Int { index }
 
     init(index: Int, channels: Int, label: String) {
@@ -87,7 +89,7 @@ struct AudioTrackInfo: Codable, Equatable, Identifiable {
         return defaultChannelName(c)
     }
 
-    enum CodingKeys: String, CodingKey { case index, channels, label, name, fileName, channelNames }
+    enum CodingKeys: String, CodingKey { case index, channels, label, name, fileName, channelNames, language }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -99,7 +101,19 @@ struct AudioTrackInfo: Codable, Equatable, Identifiable {
         name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
         fileName = try c.decodeIfPresent(String.self, forKey: .fileName) ?? ""
         channelNames = try c.decodeIfPresent([String].self, forKey: .channelNames) ?? []
+        language = try c.decodeIfPresent(String.self, forKey: .language) ?? ""
     }
+}
+
+/// An audio language a BCC Media episode offers.
+struct StreamLanguage: Codable, Equatable, Identifiable {
+    var language: String        // ISO code from the playlist, e.g. "deu", "nor"
+    var name: String            // "German"
+    var channels: Int
+    var id: String { language }
+
+    var isGerman: Bool { ["de", "deu", "ger"].contains(language.lowercased()) }
+    var isNorwegian: Bool { ["no", "nor", "nob", "nno"].contains(language.lowercased()) }
 }
 
 /// A subtitle track (text, tx3g) found in a media file.
@@ -161,6 +175,14 @@ struct Cue: Identifiable, Codable, Equatable {
     var frameRate: Double = 0          // video frames per second, 0 = unknown / no video
     var audioTracks: [AudioTrackInfo] = []
     var subtitleTracks: [SubtitleTrackInfo] = []
+    /// Set for a BCC Media episode played from the internet instead of a file
+    /// (`url` is then the episode's web link).
+    var bccEpisodeID: String?
+    /// All audio languages of a BCC Media episode; `audioTracks` are the
+    /// streams the user picked from them.
+    var streamLanguages: [StreamLanguage] = []
+
+    var isStream: Bool { bccEpisodeID != nil }
     var missing: Bool = false
 
     init(url: URL) {
@@ -289,7 +311,7 @@ struct Cue: Identifiable, Codable, Equatable {
     enum CodingKeys: String, CodingKey {
         case id, url, name, speed, volumeDB, fadeIn, fadeOut, stopFade, inPoint, outPoint,
              endAction, autoStart, audioOnly, playAlongside, routes, duration, hasVideo, videoSize, frameRate, audioTracks,
-             subtitleTracks
+             subtitleTracks, bccEpisodeID, streamLanguages
     }
 
     init(from decoder: Decoder) throws {
@@ -315,6 +337,8 @@ struct Cue: Identifiable, Codable, Equatable {
         frameRate = try c.decodeIfPresent(Double.self, forKey: .frameRate) ?? 0
         audioTracks = try c.decodeIfPresent([AudioTrackInfo].self, forKey: .audioTracks) ?? []
         subtitleTracks = try c.decodeIfPresent([SubtitleTrackInfo].self, forKey: .subtitleTracks) ?? []
+        bccEpisodeID = try c.decodeIfPresent(String.self, forKey: .bccEpisodeID)
+        streamLanguages = try c.decodeIfPresent([StreamLanguage].self, forKey: .streamLanguages) ?? []
     }
 
     func encode(to encoder: Encoder) throws {
@@ -340,6 +364,8 @@ struct Cue: Identifiable, Codable, Equatable {
         try c.encode(frameRate, forKey: .frameRate)
         try c.encode(audioTracks, forKey: .audioTracks)
         try c.encode(subtitleTracks, forKey: .subtitleTracks)
+        try c.encodeIfPresent(bccEpisodeID, forKey: .bccEpisodeID)
+        if !streamLanguages.isEmpty { try c.encode(streamLanguages, forKey: .streamLanguages) }
     }
 }
 

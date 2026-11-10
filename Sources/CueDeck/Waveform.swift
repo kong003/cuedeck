@@ -27,7 +27,7 @@ final class WaveformStore: ObservableObject {
 
     func load(_ cue: Cue) {
         let key = Self.key(for: cue)
-        guard waveforms[key] == nil, !loading.contains(key), !cue.audioTracks.isEmpty else { return }
+        guard waveforms[key] == nil, !loading.contains(key), !cue.audioTracks.isEmpty, !cue.isStream else { return }
         loading.insert(key)
         let url = cue.url
         let start = 0.0

@@ -101,11 +101,12 @@ struct VideoLane: View {
         }
         .frame(height: 48)
         .task(id: "\(cue.url.path)|\(cue.duration)") {
+            guard !cue.isStream else { return }      // no thumbnails for internet streams
             thumbs.load(url: cue.url, start: 0, end: cue.duration, count: 16)
             thumbs.requestPreview(url: cue.url, at: cue.seekTarget(playhead))
         }
         .onChange(of: playhead) { p in
-            if !isPlaying { thumbs.requestPreview(url: cue.url, at: cue.seekTarget(p)) }
+            if !isPlaying && !cue.isStream { thumbs.requestPreview(url: cue.url, at: cue.seekTarget(p)) }
         }
     }
 }

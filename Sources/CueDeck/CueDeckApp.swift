@@ -27,6 +27,8 @@ struct CueDeckApp: App {
                 Divider()
                 Button("Add Media…") { engine.addFilesWithPanel() }
                     .keyboardShortcut("i")
+                Button("Add BCC Media Link…") { engine.showBCCSheet = true }
+                    .keyboardShortcut("l", modifiers: [.command, .shift])
             }
             CommandGroup(replacing: .undoRedo) {
                 Button("Undo") { engine.undo() }

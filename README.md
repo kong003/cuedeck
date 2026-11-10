@@ -93,13 +93,19 @@ Without the script: drag CueDeck into Applications, then run
 
 The cue list is also autosaved and restored on the next launch.
 
-## Subtitles to CasparCG
+## Subtitles
+
+Without CasparCG: turn on *Show subtitles in the video output* in
+CueDeck › Settings (⌘,) › Subtitles. The first subtitle track of a video
+then appears at the bottom of the picture on the output display.
+
+### Subtitles to CasparCG
 
 Subtitles embedded in MP4 or MOV files (text tracks, as ffmpeg writes with
 `-c:s mov_text`) can play on a CasparCG server in time with the cue.
 
 1. Copy `template/caspardcg` into the template folder of the server.
-2. In CueDeck › Settings (⌘,) › CasparCG, turn on *Send subtitles to
+2. In CueDeck › Settings (⌘,) › Subtitles, turn on *Send subtitles to
    CasparCG* and enter the server IP and port. Add as many channels as
    needed with *Add Channel*: all of them show the same subtitles, with the
    template `caspardcg/subtitle` on layer 20.
