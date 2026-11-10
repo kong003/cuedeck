@@ -152,7 +152,18 @@ struct WaveformPanel: View {
     }
 
     var body: some View {
-        if let cue, cue.duration > 0 {
+        if let cue, cue.isLive {
+            // No timeline for the livestream: it always plays from "now".
+            HStack(spacing: 10) {
+                LivePreview(cue: cue)
+                Text("● LIVE").font(.caption.weight(.bold)).foregroundStyle(.red)
+                Text("\(cue.name): the BCC livestream starts a few seconds behind live and plays until it is stopped.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(.horizontal, 14).padding(.vertical, 10)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        } else if let cue, cue.duration > 0 {
             VStack(alignment: .leading, spacing: 6) {
                 TimelineControls(cue: cue)
 
@@ -173,7 +184,17 @@ struct WaveformPanel: View {
                             Text("This cue has no audio.").font(.caption).foregroundStyle(.secondary)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
-                        ForEach(cue.audioTracks) { track in
+                        // Streams have no waveforms: one loading bar for the whole cue,
+                        // next to the preview, or here if the cue has no video.
+                        if cue.isStream && !cue.hasVideo {
+                            HStack(spacing: 8) {
+                                Text("Audio").font(.caption.weight(.semibold))
+                                    .frame(width: 190, alignment: .leading)
+                                StreamLoadBar(cue: cue).frame(height: 10)
+                            }
+                            .frame(height: 16)
+                        }
+                        ForEach(cue.isStream ? [] : cue.audioTracks) { track in
                             WaveformTrackGroup(
                                 cue: cue, track: track,
                                 channelPeaks: (0..<track.channels).map { peaks(cue, track.index, $0) },
@@ -563,5 +584,72 @@ struct OutputNamesSheet: View {
         }
         .padding(20)
         .frame(width: 560)
+    }
+}
+
+/// The newest frame of the livestream, renewed every 15 seconds.
+struct LivePreview: View {
+    @EnvironmentObject var engine: PlaybackEngine
+    let cue: Cue
+    @State private var image: CGImage?
+
+    var body: some View {
+        ZStack {
+            Color.black
+            if let image {
+                Image(decorative: image, scale: 1).resizable().aspectRatio(contentMode: .fit)
+            } else {
+                Image(systemName: "dot.radiowaves.left.and.right").foregroundStyle(.secondary)
+            }
+        }
+        .frame(width: 80, height: 45)
+        .clipShape(RoundedRectangle(cornerRadius: 4))
+        .help("Current picture of the livestream")
+        .task(id: cue.id) {
+            while !Task.isCancelled {
+                if let frame = await engine.streamPreview(for: cue, at: 0) { image = frame }
+                try? await Task.sleep(nanoseconds: 15_000_000_000)
+            }
+        }
+    }
+}
+
+/// Thin bar for BCC Media cues: the whole video, the loaded part in blue,
+/// start/end points and the playhead. Click or drag to jump.
+struct StreamLoadBar: View {
+    @EnvironmentObject var engine: PlaybackEngine
+    let cue: Cue
+
+    var body: some View {
+        GeometryReader { geo in
+            let tl = FileTimeline(duration: cue.duration, width: geo.size.width)
+            let playhead = engine.playhead(for: cue.id)
+            Canvas { ctx, size in
+                let h = size.height, y = (size.height - h) / 2
+                ctx.fill(Path(roundedRect: CGRect(x: 0, y: y, width: size.width, height: h), cornerRadius: h / 2),
+                         with: .color(.secondary.opacity(0.18)))
+                if let b = engine.streamBuffered[cue.id] {
+                    let bx = tl.x(b.lowerBound)
+                    ctx.fill(Path(roundedRect: CGRect(x: bx, y: y, width: max(0, tl.x(b.upperBound) - bx), height: h),
+                                  cornerRadius: h / 2), with: .color(.accentColor.opacity(0.55)))
+                }
+                let sx = tl.x(cue.segmentStart), ex = tl.x(cue.segmentEnd)
+                let shade = GraphicsContext.Shading.color(Color(nsColor: .windowBackgroundColor).opacity(0.6))
+                if sx > 0 { ctx.fill(Path(CGRect(x: 0, y: y, width: sx, height: h)), with: shade) }
+                if ex < size.width { ctx.fill(Path(CGRect(x: ex, y: y, width: size.width - ex, height: h)), with: shade) }
+                if let playhead {
+                    ctx.fill(Path(CGRect(x: tl.x(playhead) - 1, y: 0, width: 2, height: size.height)), with: .color(.red))
+                }
+            }
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { v in
+                        if abs(v.translation.width) > 2 { engine.scrub(cue.id, toFile: tl.time(v.location.x)) }
+                    }
+                    .onEnded { v in engine.seek(cue.id, toFile: tl.time(v.location.x)) }
+            )
+        }
+        .help("Loaded part of the stream. Click or drag to jump.")
     }
 }

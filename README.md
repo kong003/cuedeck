@@ -109,7 +109,13 @@ audio language routable like the streams of a file, and their subtitles.
 
 The next BCC Media cue is loaded ahead (first audio segments, video
 buffered), so GO starts at once. The Mac needs internet during the show.
-BCC Media cues play at 1× and don't loop.
+BCC Media cues play at 1× and don't loop. Instead of thumbnails and
+waveforms the timeline shows a preview frame and one bar with the loaded
+part (only one small segment is loaded per preview).
+
+**BCC Live** (the livestream of live.bcc-connect.org): *Add BCC Live* in the
+same window. It has all live languages and subtitles, starts a few seconds
+behind live, shows ● LIVE and plays until it is stopped.
 
 ## Subtitles
 

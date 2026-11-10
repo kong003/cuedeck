@@ -17,6 +17,9 @@ enum BCCMedia {
     static let scope = "openid profile email offline_access country church"
     static let audience = "api.bcc.no"
     static let api = URL(string: "https://api.brunstad.tv/query")!
+    /// `Cue.bccEpisodeID` of the livestream.
+    static let liveID = "live"
+    static let liveLink = URL(string: "https://live.bcc-connect.org/live")!
 
     /// Episode id from a link such as https://app.bcc.media/episode/65/860
     /// (collection 65, episode 860), .../episode/860, .../ep/860 or a bare id.
@@ -99,9 +102,13 @@ enum BCCMedia {
 /// links expire after some hours, so plans are made fresh when needed).
 struct StreamPlan {
     var masterURL: URL
+    var master: HLSMaster
     /// Media playlist of each cue stream (cue.audioTracks), in order.
     var audio: [URL]
     var subtitles: [HLSMaster.Rendition]
+    /// Livestream: fresh links when the old ones expire during playback.
+    var refreshMaster: (@Sendable () async -> URL?)?
+    var refreshAudio: [@Sendable () async -> URL?] = []
 }
 
 // MARK: - HLS master playlist

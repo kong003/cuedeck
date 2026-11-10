@@ -76,7 +76,7 @@ struct BCCLinkSheet: View {
             Label("Add BCC Media Link", systemImage: "globe").font(.title3.weight(.semibold))
 
             if account.isSignedIn, case .signedIn = account.state {
-                Text("Paste the link of an episode from app.bcc.media. It plays from the internet with all its audio languages and subtitles.")
+                Text("Paste the link of an episode from app.bcc.media, or add the BCC livestream. They play from the internet with all their audio languages and subtitles.")
                     .font(.callout).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 TextField("", text: $link, prompt: Text("https://app.bcc.media/episode/…"))
@@ -89,6 +89,9 @@ struct BCCLinkSheet: View {
                     BCCAccountView(account: account).font(.caption)
                 }
                 HStack {
+                    Button { addLive() } label: { Label("Add BCC Live", systemImage: "dot.radiowaves.left.and.right") }
+                        .disabled(busy)
+                        .help("Add the BCC livestream (live.bcc-connect.org) as a cue")
                     Spacer()
                     if busy { ProgressView().controlSize(.small) }
                     Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
@@ -113,6 +116,21 @@ struct BCCLinkSheet: View {
             if let s = NSPasteboard.general.string(forType: .string), BCCMedia.episodeID(from: s) != nil, s.contains("bcc.media") {
                 link = s.trimmingCharacters(in: .whitespacesAndNewlines)
             }
+        }
+    }
+
+    private func addLive() {
+        guard !busy else { return }
+        busy = true
+        error = nil
+        Task {
+            do {
+                try await engine.addBCCLive()
+                dismiss()
+            } catch {
+                self.error = error.localizedDescription
+            }
+            busy = false
         }
     }
 

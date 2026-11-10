@@ -89,6 +89,26 @@ final class PlaybackSession: Identifiable {
     private var playerOffset: Double = 0
     /// A stream player the engine prepared ahead (already buffered).
     private var preparedPlayer: AVPlayer?
+    /// Livestream: where it starts on the stream timeline, and the playlist
+    /// proxy of its player (kept alive with the player).
+    private(set) var liveStart: LiveStartPoint?
+    private var liveProxy: LiveHLSProxy?
+
+    /// Streams: the loaded part of the video around the playhead, in file time.
+    var bufferedFileRange: ClosedRange<Double>? {
+        guard let item = player?.currentItem else { return nil }
+        let now = item.currentTime().seconds
+        for r in item.loadedTimeRanges.map(\.timeRangeValue) {
+            let a = r.start.seconds, b = (r.start + r.duration).seconds
+            if a.isFinite, b.isFinite, a <= now + 0.5, b >= now {
+                return (a + playerOffset)...(b + playerOffset)
+            }
+        }
+        return nil
+    }
+
+    /// Livestream: the current position on the stream timeline (for subtitles).
+    var liveStreamTime: Double? { liveStart.map { $0.time + mediaTime } }
 
     init(cue: Cue, output: AudioOutput?, video: VideoOutput,
          streamResolver: ((Cue) async throws -> StreamPlan)? = nil, preparedPlayer: AVPlayer? = nil) {
@@ -147,6 +167,10 @@ final class PlaybackSession: Identifiable {
         let plan = try await resolve(cue)
         if isCancelled { return }
         streamPlan = plan
+        if cue.isLive {
+            try await prepareLive(plan)
+            return
+        }
         playerOffset = cue.segmentStart
         mediaDuration = cue.segmentDuration
         let begin = clampMedia(position)
@@ -170,6 +194,33 @@ final class PlaybackSession: Identifiable {
         }
     }
 
+    /// The livestream from a few segments behind the live edge: audio and
+    /// picture both start at the beginning of the same segment.
+    private func prepareLive(_ plan: StreamPlan) async throws {
+        let start = try await LiveStartPoint.find(master: plan.master)
+        if isCancelled { return }
+        liveStart = start
+        playerOffset = 0
+        mediaDuration = cue.segmentDuration          // "endless": the cue's long nominal length
+        pausedMedia = 0
+        anchorMedia = 0
+        if output != nil, !plan.audio.isEmpty {
+            let made = try await makeStreamVoice(atMedia: 0, prefillSeconds: 1.0, ramp: 0)
+            voice = made.voice
+            decoder = made.decoder
+            voiceSpeed = 1
+            if isCancelled { return }
+        }
+        if cue.playsVideo {
+            let proxy = LiveHLSProxy(masterURL: plan.masterURL, startSequence: start.sequence,
+                                     refresh: plan.refreshMaster ?? { nil })
+            liveProxy = proxy
+            let item = AVPlayerItem(asset: proxy.makeAsset())
+            item.preferredForwardBufferDuration = 12
+            try await attachPlayer(item, begin: 0)
+        }
+    }
+
     /// Muted AVPlayer for `item` on the audio device clock, at media time
     /// `begin`, with its layer (still invisible) on the output.
     private func attachPlayer(_ item: AVPlayerItem, begin: Double, player existing: AVPlayer? = nil) async throws {
@@ -177,6 +228,8 @@ final class PlaybackSession: Identifiable {
         p.automaticallyWaitsToMinimizeStalling = false
         p.actionAtItemEnd = .pause
         p.isMuted = true
+        // Subtitles are CueDeck's job (CasparCG / overlay), never the player's.
+        p.appliesMediaSelectionCriteriaAutomatically = false
         if let clock = output?.clock { p.sourceClock = clock }
         player = p
 
@@ -191,6 +244,9 @@ final class PlaybackSession: Identifiable {
         // A prepared player is usually at the right place already.
         if begin + playerOffset > 0, abs(p.currentTime().seconds - (begin + playerOffset)) > 0.02 || existing == nil {
             _ = await p.seek(to: playerTime(begin), toleranceBefore: .zero, toleranceAfter: .zero)
+        }
+        if let group = try? await item.asset.loadMediaSelectionGroup(for: .legible) {
+            item.select(nil, in: group)
         }
         if item.status == .readyToPlay {
             _ = await p.preroll(atRate: Float(speed))
@@ -219,7 +275,9 @@ final class PlaybackSession: Identifiable {
         let v = try createVoice(channelCounts: channels.map { UInt32($0) }, atMedia: media, speed: 1, ramp: ramp)
         let dec = StreamAudioDecoder(playlists: plan.audio, channels: channels,
                                      start: cue.segmentStart + media, end: cue.segmentEnd,
-                                     sampleRate: out.sampleRate, mixer: out.mixer, voice: v)
+                                     sampleRate: out.sampleRate, mixer: out.mixer, voice: v,
+                                     live: liveStart.map { .init(sequence: $0.sequence, time: $0.time, refresh: nil) },
+                                     refresh: plan.refreshAudio)
         dec.start()
         _ = await dec.waitForPrefill(seconds: prefillSeconds, sampleRate: out.sampleRate, timeout: 15)
         if let failure = dec.failure {
@@ -416,7 +474,7 @@ final class PlaybackSession: Identifiable {
 
     /// Live scrubbing while dragging: pauses and shows the frame on the output.
     func scrub(toMedia target: Double) {
-        guard state == .playing || state == .paused else { return }
+        guard state == .playing || state == .paused, !cue.isLive else { return }
         if state == .playing {
             pause()
             resumeAfterScrub = true
@@ -430,7 +488,7 @@ final class PlaybackSession: Identifiable {
     /// Jumps to media time `target`. Keeps playing if the cue was playing (or
     /// was playing before scrubbing), otherwise stays paused there.
     func seek(toMedia target: Double) async {
-        guard state == .playing || state == .paused else { return }
+        guard state == .playing || state == .paused, !cue.isLive else { return }
         let shouldResume = state == .playing || resumeAfterScrub
         resumeAfterScrub = false
         if state == .playing { pause() }

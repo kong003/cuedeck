@@ -42,6 +42,9 @@ final class ThumbnailStore: ObservableObject {
         }
     }
 
+    /// A preview made elsewhere (stream frames).
+    func setPreview(_ image: CGImage?) { if let image { preview = image } }
+
     /// A sharper single frame at `seconds`, for the preview while skimming.
     func requestPreview(url: URL, at seconds: Double) {
         previewTask?.cancel()
@@ -84,7 +87,7 @@ struct VideoLane: View {
                     Image(systemName: "film").foregroundStyle(.secondary)
                 }
             }
-            .frame(width: 80, height: 45)
+            .frame(width: cue.isStream ? 64 : 80, height: cue.isStream ? 36 : 45)
             .clipShape(RoundedRectangle(cornerRadius: 4))
 
             VStack(alignment: .leading, spacing: 1) {
@@ -93,17 +96,33 @@ struct VideoLane: View {
                     .font(.system(size: 9)).foregroundStyle(.secondary)
                     .lineLimit(2)
             }
-            .frame(width: 102, alignment: .leading)
+            .frame(width: cue.isStream ? 118 : 102, alignment: .leading)
 
-            ScrubBar(cue: cue, playhead: playhead, thumbnails: thumbs.thumbnails) { seconds, final in
-                if final { engine.seek(cue.id, toFile: seconds) } else { engine.scrub(cue.id, toFile: seconds) }
+            // Streams: no thumbnail strip (it would mean loading the whole video);
+            // a thin bar shows how much is loaded instead.
+            if cue.isStream {
+                StreamLoadBar(cue: cue).frame(height: 10)
+            } else {
+                ScrubBar(cue: cue, playhead: playhead, thumbnails: thumbs.thumbnails) { seconds, final in
+                    if final { engine.seek(cue.id, toFile: seconds) } else { engine.scrub(cue.id, toFile: seconds) }
+                }
             }
         }
-        .frame(height: 48)
+        .frame(height: cue.isStream ? 36 : 48)
         .task(id: "\(cue.url.path)|\(cue.duration)") {
-            guard !cue.isStream else { return }      // no thumbnails for internet streams
+            if cue.isStream {
+                thumbs.setPreview(await engine.streamPreview(for: cue, at: cue.seekTarget(playhead)))
+                return
+            }
             thumbs.load(url: cue.url, start: 0, end: cue.duration, count: 16)
             thumbs.requestPreview(url: cue.url, at: cue.seekTarget(playhead))
+        }
+        .task(id: cue.isStream && !isPlaying ? playhead : -1) {
+            // Stream preview at the playhead, after it has rested a moment.
+            guard cue.isStream, !isPlaying else { return }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            if Task.isCancelled { return }
+            thumbs.setPreview(await engine.streamPreview(for: cue, at: cue.seekTarget(playhead)))
         }
         .onChange(of: playhead) { p in
             if !isPlaying && !cue.isStream { thumbs.requestPreview(url: cue.url, at: cue.seekTarget(p)) }

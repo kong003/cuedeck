@@ -18,13 +18,16 @@ struct HLSMediaPlaylist {
         var url: URL
         var start: Double       // seconds, sum of the EXTINF durations before it
         var duration: Double
+        var sequence: Int       // media sequence number
     }
     var initURL: URL?
     var segments: [Segment] = []
+    var isLive = true           // until #EXT-X-ENDLIST
     var duration: Double { segments.last.map { $0.start + $0.duration } ?? 0 }
 
-    static func load(_ url: URL) async throws -> HLSMediaPlaylist {
-        let data = try await StreamAudioTrack.fetch(url)
+    /// `cached: false` for live playlists, which change all the time.
+    static func load(_ url: URL, cached: Bool = true) async throws -> HLSMediaPlaylist {
+        let data = try await StreamAudioTrack.fetch(url, cached: cached)
         return parse(String(decoding: data, as: UTF8.self), base: url)
     }
 
@@ -32,17 +35,23 @@ struct HLSMediaPlaylist {
         var p = HLSMediaPlaylist()
         var nextDuration: Double?
         var t = 0.0
+        var sequence = 0
         for raw in text.components(separatedBy: .newlines) {
             let line = raw.trimmingCharacters(in: .whitespaces)
-            if line.hasPrefix("#EXT-X-MAP:") {
+            if line.hasPrefix("#EXT-X-MEDIA-SEQUENCE:") {
+                sequence = Int(line.dropFirst("#EXT-X-MEDIA-SEQUENCE:".count)) ?? 0
+            } else if line.hasPrefix("#EXT-X-ENDLIST") {
+                p.isLive = false
+            } else if line.hasPrefix("#EXT-X-MAP:") {
                 let a = HLSMaster.attributes(String(line.dropFirst("#EXT-X-MAP:".count)))
                 if let uri = a["URI"] { p.initURL = URL(string: uri, relativeTo: base)?.absoluteURL }
             } else if line.hasPrefix("#EXTINF:") {
                 nextDuration = Double(line.dropFirst("#EXTINF:".count).split(separator: ",").first ?? "")
             } else if !line.isEmpty && !line.hasPrefix("#"), let d = nextDuration,
                       let url = URL(string: line, relativeTo: base)?.absoluteURL {
-                p.segments.append(Segment(url: url, start: t, duration: d))
+                p.segments.append(Segment(url: url, start: t, duration: d, sequence: sequence))
                 t += d
+                sequence += 1
                 nextDuration = nil
             }
         }
@@ -227,14 +236,21 @@ final class StreamAudioDecoder: VoiceFeeder, @unchecked Sendable {
     private let group = DispatchGroup()
     private var started = false
 
-    /// `playlists[t]` feeds track t from file time `start` to `end`.
+    /// `playlists[t]` feeds track t from file time `start` to `end`, or for a
+    /// livestream from `live` on (`refresh[t]` renews an expired link).
     init(playlists: [URL], channels: [Int], start: Double, end: Double,
-         sampleRate: Double, mixer: OpaquePointer, voice: Int32) {
+         sampleRate: Double, mixer: OpaquePointer, voice: Int32,
+         live: StreamAudioTrack.LiveStart? = nil, refresh: [@Sendable () async -> URL?] = []) {
         self.mixer = mixer
         self.voice = voice
         tracks = zip(playlists, channels).enumerated().map { t, pc in
-            StreamAudioTrack(playlistURL: pc.0, start: start, end: end, outputRate: sampleRate, channels: pc.1,
-                             sink: MixerTrackSink(mixer: mixer, voice: voice, track: UInt32(t)))
+            let track = StreamAudioTrack(playlistURL: pc.0, start: start, end: end, outputRate: sampleRate, channels: pc.1,
+                                         sink: MixerTrackSink(mixer: mixer, voice: voice, track: UInt32(t)))
+            if var l = live {
+                l.refresh = t < refresh.count ? refresh[t] : nil
+                track.live = l
+            }
+            return track
         }
     }
 
@@ -279,6 +295,16 @@ final class StreamAudioDecoder: VoiceFeeder, @unchecked Sendable {
 
 /// Streams one audio rendition into a sink from file time `start` to `end`.
 final class StreamAudioTrack: @unchecked Sendable {
+    /// Livestreams: start with media sequence `sequence`, exactly at stream
+    /// time `time` (seconds of the fragment timeline), and play until cancelled.
+    /// `refresh` gives a new playlist link when the old one has expired.
+    struct LiveStart {
+        var sequence: Int
+        var time: Double
+        var refresh: (@Sendable () async -> URL?)?
+    }
+
+    var live: LiveStart?
     let playlistURL: URL
     let start: Double
     let end: Double
@@ -308,6 +334,10 @@ final class StreamAudioTrack: @unchecked Sendable {
     func run() async {
         defer { done = true }
         do {
+            if let live {
+                try await runLive(live)
+                return
+            }
             let playlist = try await HLSMediaPlaylist.load(playlistURL)
             guard let initURL = playlist.initURL, !playlist.segments.isEmpty else {
                 throw StreamError("The audio stream has no segments.")
@@ -372,6 +402,65 @@ final class StreamAudioTrack: @unchecked Sendable {
         }
     }
 
+    /// Livestream: segments from `live.sequence` on, reloading the playlist for
+    /// new ones, for as long as the cue plays.
+    private func runLive(_ live: LiveStart) async throws {
+        var url = playlistURL
+        func reload() async throws -> HLSMediaPlaylist {
+            do {
+                return try await HLSMediaPlaylist.load(url, cached: false)
+            } catch {
+                // The signed link may have expired: ask for a fresh one once.
+                guard let fresh = await live.refresh?() else { throw error }
+                url = fresh
+                return try await HLSMediaPlaylist.load(url, cached: false)
+            }
+        }
+        var playlist = try await reload()
+        guard let initURL = playlist.initURL else { throw StreamError("The livestream has no audio.") }
+        let info = try FMP4.parseInit(try await Self.fetch(initURL))
+        let decoder = try AACDecoder(info: info, outputRate: outputRate, outputChannels: channels)
+
+        var next = live.sequence
+        var cursor: Double?
+        var lastNew = Date()
+        while !cancelled {
+            let pending = playlist.segments.filter { $0.sequence >= next }
+            if pending.isEmpty {
+                if Date().timeIntervalSince(lastNew) > 30 { throw StreamError("The livestream stopped.") }
+                try await Task.sleep(nanoseconds: 1_500_000_000)
+                playlist = try await reload()
+                // Fell out of the window (e.g. a long network outage): go on from what is there.
+                if let first = playlist.segments.first, first.sequence > next { next = first.sequence }
+                continue
+            }
+            for s in pending {
+                if cancelled { throw CancellationError() }
+                let data = try await Self.fetch(s.url, cached: false)
+                next = s.sequence + 1
+                lastNew = Date()
+                let fragment = try FMP4.parseSegment(data, info)
+                if cursor == nil { cursor = Double(fragment.baseTime) / Double(info.timescale) }
+                var pcm = try decoder.decode(fragment)
+                let frames = pcm.count / channels
+                let t0 = cursor!
+                cursor = t0 + Double(frames) / outputRate
+                var from = 0
+                if s.sequence == live.sequence {
+                    // Line the first segment up with the picture, which starts at live.time.
+                    if t0 < live.time {
+                        from = min(frames, Int(((live.time - t0) * outputRate).rounded()))
+                    } else if t0 > live.time {
+                        var silence = [Float](repeating: 0, count: Int(((t0 - live.time) * outputRate).rounded()) * channels)
+                        try await write(&silence, from: 0, to: silence.count / channels)
+                    }
+                }
+                if from < frames { try await write(&pcm, from: from, to: frames) }
+            }
+            playlist = try await reload()
+        }
+    }
+
     /// Writes frames [from, to) of `pcm`, waiting for room in the ring.
     private func write(_ pcm: inout [Float], from: Int, to: Int) async throws {
         var at = from
@@ -403,8 +492,8 @@ final class StreamAudioTrack: @unchecked Sendable {
         }
     }
 
-    static func fetch(_ url: URL) async throws -> Data {
-        if let cached = StreamCache.shared.data(for: url) { return cached }
+    static func fetch(_ url: URL, cached: Bool = true) async throws -> Data {
+        if cached, let hit = StreamCache.shared.data(for: url) { return hit }
         var lastError: Error?
         for attempt in 0..<3 {
             do {
@@ -413,7 +502,7 @@ final class StreamAudioTrack: @unchecked Sendable {
                 let (data, response) = try await URLSession.shared.data(for: request)
                 let status = (response as? HTTPURLResponse)?.statusCode ?? 200
                 guard status == 200 else { throw StreamError("The stream answered \(status).") }
-                StreamCache.shared.store(data, for: url)
+                if cached { StreamCache.shared.store(data, for: url) }
                 return data
             } catch {
                 lastError = error

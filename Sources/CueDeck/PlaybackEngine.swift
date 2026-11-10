@@ -17,6 +17,7 @@ struct NowPlaying: Equatable, Identifiable {
     var paused: Bool
     var stopping: Bool
     var isStream = false
+    var isLive = false
 }
 
 @MainActor
@@ -100,6 +101,8 @@ final class PlaybackEngine: NSObject, ObservableObject {
     @Published private(set) var outputChannels = 0
     @Published private(set) var playing: [NowPlaying] = []
     @Published private(set) var activeCueIDs: Set<UUID> = []
+    /// BCC Media cues: up to where (file time) the stream is loaded, from where.
+    @Published private(set) var streamBuffered: [UUID: ClosedRange<Double>] = [:]
     /// Current file position (seconds) of every playing or paused cue.
     @Published private(set) var playheads: [UUID: Double] = [:]
     /// Where a cue that isn't playing will start (file seconds), set by clicking its timeline.
@@ -127,6 +130,7 @@ final class PlaybackEngine: NSObject, ObservableObject {
     /// Subtitles read from files, by "path|trackID".
     private var subtitleCache: [String: [SubtitleEntry]] = [:]
     private var subtitlesLoading: Set<String> = []
+    private var liveSubtitleFeeds: [String: LiveSubtitleFeed] = [:]
     private var output: AudioOutput?
     private var sessions: [PlaybackSession] = []
     private var timer: Timer?
@@ -364,32 +368,7 @@ final class PlaybackEngine: NSObject, ObservableObject {
         cue.name = episode.title
         cue.bccEpisodeID = episode.id
         cue.duration = episode.duration
-        if let best = master.variants.max(by: { $0.height < $1.height }) {
-            cue.hasVideo = true
-            cue.videoSize = best.width > 0 ? "\(best.width)×\(best.height)" : "Video"
-            cue.frameRate = best.frameRate
-            if best.frameRate > 0 { cue.videoSize += String(format: " · %g fps", (best.frameRate * 100).rounded() / 100) }
-        }
-        cue.streamLanguages = master.audio.map { StreamLanguage(language: $0.language, name: $0.name, channels: $0.channels) }
-        // Two streams by default: German and Norwegian (only one of them if the
-        // other is missing); without either, the episode's default language.
-        var picked = [cue.streamLanguages.first(where: \.isGerman), cue.streamLanguages.first(where: \.isNorwegian)]
-            .compactMap { $0 }
-        if picked.isEmpty {
-            let fallback = master.audio.firstIndex(where: \.isDefault) ?? 0
-            if fallback < cue.streamLanguages.count { picked = [cue.streamLanguages[fallback]] }
-        }
-        cue.audioTracks = picked.enumerated().map { Self.streamSlot($0, $1) }
-        // German subtitles first, then Norwegian (the first track is the one shown).
-        let rank: (HLSMaster.Rendition) -> Int = { r in
-            let l = StreamLanguage(language: r.language, name: r.name, channels: 0)
-            return l.isGerman ? 0 : (l.isNorwegian ? 1 : 2)
-        }
-        let subs = master.subtitles.enumerated().sorted { (rank($0.element), $0.offset) < (rank($1.element), $1.offset) }
-        cue.subtitleTracks = subs.enumerated().map { i, pair in
-            SubtitleTrackInfo(index: i, trackID: Int32(pair.offset), language: pair.element.language, fileName: pair.element.name)
-        }
-        cue.normalizeRoutes(outputChannels: routingChannels, defaults: defaultRouting)
+        configureStream(&cue, master: master)
         if let index { cues.insert(cue, at: min(max(index, 0), cues.count)) } else { cues.append(cue) }
         selection = cue.id          // also loads it ahead
     }
@@ -403,6 +382,8 @@ final class PlaybackEngine: NSObject, ObservableObject {
         preload = (cue.id, fileTime, nil)
         preloadTask = Task { [weak self] in
             guard let self, let plan = try? await self.streamPlan(for: cue), !Task.isCancelled else { return }
+            // The livestream always starts "now": only its links are looked up ahead.
+            if cue.isLive { return }
             if self.caspar.enabled || self.subtitlesOnVideo { self.loadStreamSubtitles(cue) }
             await withTaskGroup(of: Void.self) { group in
                 for url in plan.audio {
@@ -447,23 +428,23 @@ final class PlaybackEngine: NSObject, ObservableObject {
         return player
     }
 
+    /// Preview frame of a BCC Media cue at file time `time` (the newest frame for the livestream).
+    func streamPreview(for cue: Cue, at time: Double) async -> CGImage? {
+        guard let plan = try? await streamPlan(for: cue) else { return nil }
+        return await StreamFrameGrabber.frame(master: plan.master, at: cue.isLive ? nil : time)
+    }
+
     /// The current stream links for a BCC Media cue: the master playlist and
     /// one audio playlist per cue stream (matched by language).
     func streamPlan(for cue: Cue) async throws -> StreamPlan {
         guard let id = cue.bccEpisodeID else { throw StreamError("\(cue.name) is not a BCC Media cue.") }
         var entry = streamMasters[id]
         // BCC Media renews its stream links regularly; a link must last the
-        // whole cue (plus a margin), or it would stop working mid-show.
-        let needed = Date().addingTimeInterval(cue.segmentDuration + 600)
+        // whole cue (plus a margin), or it would stop working mid-show. The
+        // livestream renews its links while it plays instead.
+        let needed = Date().addingTimeInterval((cue.isLive ? 0 : cue.segmentDuration) + 600)
         if entry == nil || entry!.expires < needed {
-            guard bcc.isSignedIn else {
-                throw StreamError("Sign in to BCC Media to play \(cue.name) (File › Add BCC Media Link…).")
-            }
-            let token = try await bcc.accessToken()
-            let episode = try await BCCMedia.episode(id: id, token: token)
-            let master = try await HLSMaster.load(episode.streamURL)
-            entry = (episode.streamURL, master, episode.expiresAt ?? Date().addingTimeInterval(3600))
-            streamMasters[id] = entry
+            entry = try await loadStreamMaster(for: cue)
         }
         guard let entry else { throw StreamError("No stream for \(cue.name).") }
         let audio = try cue.audioTracks.map { t -> URL in
@@ -471,7 +452,57 @@ final class PlaybackEngine: NSObject, ObservableObject {
             if t.language.isEmpty, t.index < entry.master.audio.count { return entry.master.audio[t.index].url }
             throw StreamError("\(cue.name): the language \(t.fileName) is no longer offered.")
         }
-        return StreamPlan(masterURL: entry.url, audio: audio, subtitles: entry.master.subtitles)
+        var plan = StreamPlan(masterURL: entry.url, master: entry.master, audio: audio, subtitles: entry.master.subtitles)
+        if cue.isLive {
+            plan.refreshMaster = { [weak self] in
+                guard let self else { return nil }
+                return await (try? self.loadStreamMaster(for: cue))?.url
+            }
+            plan.refreshAudio = cue.audioTracks.map { t in
+                { [weak self] in
+                    guard let self, let fresh = try? await self.loadStreamMaster(for: cue) else { return nil }
+                    return fresh.master.audio.first { $0.language == t.language }?.url
+                }
+            }
+        }
+        return plan
+    }
+
+    /// Fresh stream links from BCC Media for an episode or the livestream.
+    private func loadStreamMaster(for cue: Cue) async throws -> (url: URL, master: HLSMaster, expires: Date) {
+        guard let id = cue.bccEpisodeID else { throw StreamError("\(cue.name) is not a BCC Media cue.") }
+        guard bcc.isSignedIn else {
+            throw StreamError("Sign in to BCC Media to play \(cue.name) (File › Add BCC Media Link…).")
+        }
+        let token = try await bcc.accessToken()
+        let url: URL, expires: Date?
+        if cue.isLive {
+            guard let live = try await BCCMedia.live(token: token) else { throw StreamError("BCC Live is offline right now.") }
+            (url, expires) = (live.url, live.expiresAt)
+        } else {
+            let episode = try await BCCMedia.episode(id: id, token: token)
+            (url, expires) = (episode.streamURL, episode.expiresAt)
+        }
+        let master = try await HLSMaster.load(url)
+        let entry = (url, master, expires ?? Date().addingTimeInterval(3600))
+        streamMasters[id] = entry
+        return entry
+    }
+
+    /// Adds the BCC livestream (live.bcc-connect.org) as a cue: all its
+    /// languages and subtitles, German and Norwegian as the first streams.
+    func addBCCLive(at index: Int? = nil) async throws {
+        let token = try await bcc.accessToken()
+        guard let live = try await BCCMedia.live(token: token) else { throw StreamError("BCC Live is offline right now.") }
+        let master = try await HLSMaster.load(live.url)
+        var cue = Cue(url: BCCMedia.liveLink)
+        cue.name = "BCC Live"
+        cue.bccEpisodeID = BCCMedia.liveID
+        cue.duration = 7 * 24 * 3600                 // endless, plays until stopped
+        configureStream(&cue, master: master)
+        streamMasters[BCCMedia.liveID] = (live.url, master, live.expiresAt ?? Date().addingTimeInterval(3600))
+        if let index { cues.insert(cue, at: min(max(index, 0), cues.count)) } else { cues.append(cue) }
+        selection = cue.id
     }
 
     private static func streamSlot(_ index: Int, _ l: StreamLanguage) -> AudioTrackInfo {
@@ -517,6 +548,37 @@ final class PlaybackEngine: NSObject, ObservableObject {
             return t
         }
         updateCue(cue)
+    }
+
+    /// Video size, languages (German and Norwegian as the first streams) and
+    /// subtitles (German first) of a BCC Media stream.
+    private func configureStream(_ cue: inout Cue, master: HLSMaster) {
+        if let best = master.variants.max(by: { $0.height < $1.height }) {
+            cue.hasVideo = true
+            cue.videoSize = best.width > 0 ? "\(best.width)×\(best.height)" : "Video"
+            cue.frameRate = best.frameRate
+            if best.frameRate > 0 { cue.videoSize += String(format: " · %g fps", (best.frameRate * 100).rounded() / 100) }
+        }
+        cue.streamLanguages = master.audio.map { StreamLanguage(language: $0.language, name: $0.name, channels: $0.channels) }
+        // Two streams by default: German and Norwegian (only one of them if the
+        // other is missing); without either, the episode's default language.
+        var picked = [cue.streamLanguages.first(where: \.isGerman), cue.streamLanguages.first(where: \.isNorwegian)]
+            .compactMap { $0 }
+        if picked.isEmpty {
+            let fallback = master.audio.firstIndex(where: \.isDefault) ?? 0
+            if fallback < cue.streamLanguages.count { picked = [cue.streamLanguages[fallback]] }
+        }
+        cue.audioTracks = picked.enumerated().map { Self.streamSlot($0, $1) }
+        // German subtitles first, then Norwegian (the first track is the one shown).
+        let rank: (HLSMaster.Rendition) -> Int = { r in
+            let l = StreamLanguage(language: r.language, name: r.name, channels: 0)
+            return l.isGerman ? 0 : (l.isNorwegian ? 1 : 2)
+        }
+        let subs = master.subtitles.enumerated().sorted { (rank($0.element), $0.offset) < (rank($1.element), $1.offset) }
+        cue.subtitleTracks = subs.enumerated().map { i, pair in
+            SubtitleTrackInfo(index: i, trackID: Int32(pair.offset), language: pair.element.language, fileName: pair.element.name)
+        }
+        cue.normalizeRoutes(outputChannels: routingChannels, defaults: defaultRouting)
     }
 
     /// Adds files to the list, at `index` (where they were dropped) or at the end.
@@ -955,7 +1017,12 @@ final class PlaybackEngine: NSObject, ObservableObject {
             onVideo = cue.playsVideo
             let key = subtitleKey(cue, track)
             if let entries = subtitleCache[key], s.state != .preparing {
-                lines = SubtitleReader.entry(at: s.displayedFileTime, in: entries)?.lines ?? []
+                var t = s.liveStreamTime ?? s.displayedFileTime
+                // Live cue times may count on the MPEG-TS clock, which wraps every 26.5 hours.
+                if cue.isLive, let last = entries.last, abs(last.start - t) > 86400 {
+                    t = t.truncatingRemainder(dividingBy: 95443.717688888889)
+                }
+                lines = SubtitleReader.entry(at: t, in: entries)?.lines ?? []
             } else {
                 if cue.isStream { loadStreamSubtitles(cue) } else { loadSubtitles(url: cue.url, trackID: track.trackID, key: key) }
                 lines = []             // CasparCG loads the template now, ready for the first line
@@ -973,6 +1040,10 @@ final class PlaybackEngine: NSObject, ObservableObject {
     private func loadStreamSubtitles(_ cue: Cue) {
         guard let track = cue.selectedSubtitles else { return }
         let key = subtitleKey(cue, track)
+        if cue.isLive {
+            startLiveSubtitles(cue, track: track, key: key)
+            return
+        }
         guard subtitleCache[key] == nil, !subtitlesLoading.contains(key) else { return }
         subtitlesLoading.insert(key)
         Task {
@@ -982,6 +1053,27 @@ final class PlaybackEngine: NSObject, ObservableObject {
                     ?? (Int(track.trackID) < plan.subtitles.count ? plan.subtitles[Int(track.trackID)] : nil)
             else { return }
             subtitleCache[key] = await SubtitleReader.loadHLS(playlistURL: rendition.url)
+        }
+    }
+
+    /// Livestream subtitles: reloaded every few seconds while the cue plays.
+    private func startLiveSubtitles(_ cue: Cue, track: SubtitleTrackInfo, key: String) {
+        guard liveSubtitleFeeds[key] == nil, !subtitlesLoading.contains(key) else { return }
+        subtitlesLoading.insert(key)
+        Task {
+            defer { subtitlesLoading.remove(key) }
+            guard let plan = try? await streamPlan(for: cue),
+                  let rendition = plan.subtitles.first(where: { $0.language == track.language }) else { return }
+            let feed = LiveSubtitleFeed(playlistURL: rendition.url)
+            liveSubtitleFeeds[key] = feed
+            while true {
+                await feed.update()
+                subtitleCache[key] = feed.entries
+                if !sessions.contains(where: { $0.cue.isLive && $0.isActive }) { break }
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+            }
+            liveSubtitleFeeds[key] = nil
+            subtitleCache[key] = nil
         }
     }
 
@@ -1007,13 +1099,19 @@ final class PlaybackEngine: NSObject, ObservableObject {
                               progress: s.duration > 0 ? t / s.duration : 0,
                               speed: s.speed,
                               paused: s.state == .paused, stopping: s.state == .stopping,
-                              isStream: s.cue.isStream)
+                              isStream: s.cue.isStream, isLive: s.cue.isLive)
         }
         if list != playing { playing = list }
 
         var heads: [UUID: Double] = [:]
         for s in visible where s.state != .stopping { heads[s.cue.id] = s.fileTime }
         if heads != playheads { playheads = heads }
+
+        var buffered: [UUID: ClosedRange<Double>] = [:]
+        for s in visible where s.cue.isStream && !s.cue.isLive {
+            if let r = s.bufferedFileRange { buffered[s.cue.id] = r }
+        }
+        if buffered != streamBuffered { streamBuffered = buffered }
     }
 
     // MARK: - Default app

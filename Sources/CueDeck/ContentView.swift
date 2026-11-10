@@ -382,8 +382,9 @@ struct NowPlayingRow: View {
                 .buttonStyle(.borderless)
                 .fixedSize()
             }
-            ProgressView(value: min(max(np.progress, 0), 1))
+            ProgressView(value: np.isLive ? 1 : min(max(np.progress, 0), 1))
                 .controlSize(.small)
+                .tint(np.isLive ? .red : nil)
         }
     }
 
@@ -410,8 +411,13 @@ struct NowPlayingRow: View {
                 Text(formatTime(np.elapsed)).monospacedDigit().foregroundStyle(.secondary)
                     .help("Time played")
             }
-            Text("−\(formatTime(np.remaining))").monospacedDigit().font(.body.weight(.semibold))
-                .help("Time remaining")
+            if np.isLive {
+                Text("● LIVE").font(.body.weight(.bold)).foregroundStyle(.red)
+                    .help("The BCC livestream, plays until it is stopped")
+            } else {
+                Text("−\(formatTime(np.remaining))").monospacedDigit().font(.body.weight(.semibold))
+                    .help("Time remaining")
+            }
         }
         .lineLimit(1)
         .fixedSize()
@@ -559,7 +565,13 @@ struct CueRow: View {
 
     /// Remaining time while playing (green, orange when paused), else the length.
     @ViewBuilder private var timeLabel: some View {
-        if let np = nowPlaying {
+        if cue.isLive {
+            Text("● LIVE")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(nowPlaying == nil ? Color.secondary : (nowPlaying!.paused ? Color.orange : Color.red))
+                .fixedSize()
+                .help("The BCC livestream, plays until it is stopped")
+        } else if let np = nowPlaying {
             Text(cue.endAction == .loop ? "∞" : "−\(formatTime(np.remaining))")
                 .monospacedDigit()
                 .fontWeight(.semibold)
@@ -601,7 +613,7 @@ struct CueRow: View {
                     .foregroundStyle(isNext ? Color.green : Color.secondary)
             }
             .frame(width: 40, alignment: .trailing)
-            Image(systemName: cue.isStream ? "globe" : (cue.playsVideo ? "film" : "waveform"))
+            Image(systemName: cue.isLive ? "dot.radiowaves.left.and.right" : cue.isStream ? "globe" : (cue.playsVideo ? "film" : "waveform"))
                 .frame(width: 18)
             VStack(alignment: .leading, spacing: 4) {
                 // Line 1: name, and the time on the right.

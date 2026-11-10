@@ -183,6 +183,8 @@ struct Cue: Identifiable, Codable, Equatable {
     var streamLanguages: [StreamLanguage] = []
 
     var isStream: Bool { bccEpisodeID != nil }
+    /// The BCC livestream (live.bcc-connect.org) instead of an episode.
+    var isLive: Bool { bccEpisodeID == BCCMedia.liveID }
     var missing: Bool = false
 
     init(url: URL) {

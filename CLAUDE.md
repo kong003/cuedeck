@@ -78,7 +78,18 @@ mixer, one small Objective-C helper. macOS 13+, Apple Silicon.
   measured within 1 ms). Player time = media time + `playerOffset`. The next
   stream cue is preloaded (`preloadStream`: segments into `StreamCache`,
   buffered AVPlayer handed to the session). Streams: 1× only, no loop
-  (owner's decision).
+  (owner's decision). No thumbnail strip or waveforms for streams (would mean
+  loading everything): `StreamFrameGrabber` makes the preview from one small
+  segment, `StreamLoadBar` (one bar per cue, owner's wish) shows the loaded part.
+- BCC Live (`LiveStream.swift`, `bccEpisodeID == "live"`): `live { url }` in the
+  same API. `LiveStartPoint` picks the segment 3 behind the live edge and its
+  tfdt; audio runs `StreamAudioTrack` in live mode (playlist reloads, link
+  renewal); the AVPlayer loads its playlists through `LiveHLSProxy`
+  (`cuedeck-live://`), which cuts them to start at that segment, so player
+  time 0 = audio start (measured in sync within 1 ms). The proxy drops
+  subtitles; players never draw subtitles (legible selection set to none).
+  `LiveSubtitleFeed` reloads live WebVTT; times are matched to the stream
+  timeline (`liveStreamTime`, MPEG-TS wrap handled).
 - `Sources/ObjCSupport`: `CDCatchException`. AVFoundation raises Objective-C
   exceptions for settings it rejects, which Swift can't catch and which kill
   the app. Wrap risky AVFoundation calls (reader outputs, `canAdd`/`add`) in it.

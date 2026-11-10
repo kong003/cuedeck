@@ -47,11 +47,12 @@ struct CueInspector: View {
             Section("Media") {
                 TextField("Name", text: $cue.name)
                 LabeledContent("File") {
-                    Text(cue.isStream ? "BCC Media · episode \(cue.bccEpisodeID ?? "")" : cue.url.lastPathComponent)
+                    Text(cue.isLive ? "BCC Live · live.bcc-connect.org"
+                         : cue.isStream ? "BCC Media · episode \(cue.bccEpisodeID ?? "")" : cue.url.lastPathComponent)
                         .lineLimit(1).truncationMode(.middle)
                         .help(cue.isStream ? cue.url.absoluteString : cue.url.path)
                 }
-                LabeledContent("Duration", value: formatTime(cue.duration))
+                LabeledContent("Duration", value: cue.isLive ? "Live" : formatTime(cue.duration))
                 LabeledContent("Video", value: cue.hasVideo ? (cue.videoSize.isEmpty ? "Yes" : cue.videoSize) : "None")
                 LabeledContent("Audio", value: cue.audioTracks.isEmpty ? "None" :
                     "\(cue.audioTracks.count) stream\(cue.audioTracks.count == 1 ? "" : "s"), \(cue.audioTracks.reduce(0) { $0 + $1.channels }) channels")
@@ -112,7 +113,7 @@ struct CueInspector: View {
                     }
                     .help("Stop at the end, or loop seamlessly until stopped")
                 }
-                LabeledContent("Plays for", value: cue.endAction == .loop ? "Until stopped" : formatTime(cue.playDuration))
+                LabeledContent("Plays for", value: cue.endAction == .loop || cue.isLive ? "Until stopped" : formatTime(cue.playDuration))
             } header: {
                 Text("Playback")
             } footer: {
