@@ -95,6 +95,15 @@ enum BCCMedia {
     }
 }
 
+/// Where a BCC Media cue's audio and video come from right now (the stream
+/// links expire after some hours, so plans are made fresh when needed).
+struct StreamPlan {
+    var masterURL: URL
+    /// Media playlist of each cue stream (cue.audioTracks), in order.
+    var audio: [URL]
+    var subtitles: [HLSMaster.Rendition]
+}
+
 // MARK: - HLS master playlist
 
 /// The parts of an HLS master playlist CueDeck uses.

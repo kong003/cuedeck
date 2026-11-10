@@ -10,7 +10,7 @@ enum AudioCleanup {
     static let queue = DispatchQueue(label: "CueDeck.audio-cleanup", qos: .utility)
 
     /// Silences a voice now and frees it (and its decoder) in the background.
-    static func release(voice: Int32, decoder: AudioDecoder?, output: AudioOutput?) {
+    static func release(voice: Int32, decoder: VoiceFeeder?, output: AudioOutput?) {
         guard let output, voice >= 0 else {
             if let decoder { queue.async { decoder.cancelAndWait() } }
             return
@@ -51,10 +51,10 @@ final class PlaybackSession: Identifiable {
 
     private var voice: Int32 = -1
     private var voiceSpeed: Double = 1
-    private var decoder: AudioDecoder?
+    private var decoder: VoiceFeeder?
     /// The previous stream during a speed crossfade.
     private var retiringVoice: Int32 = -1
-    private var retiringDecoder: AudioDecoder?
+    private var retiringDecoder: VoiceFeeder?
     private var audioAsset: AVComposition?
     private var audioTracks: [(track: AVCompositionTrack, channels: Int, layout: Data?)] = []
 
@@ -82,11 +82,23 @@ final class PlaybackSession: Identifiable {
     private var targetSpeed: Double
     private var speedTask: Task<Void, Never>?
 
-    init(cue: Cue, output: AudioOutput?, video: VideoOutput) {
+    // BCC Media streams: where the audio and video come from. The stream's
+    // player runs in file time, so player time = media time + playerOffset.
+    private let streamResolver: ((Cue) async throws -> StreamPlan)?
+    private var streamPlan: StreamPlan?
+    private var playerOffset: Double = 0
+    /// A stream player the engine prepared ahead (already buffered).
+    private var preparedPlayer: AVPlayer?
+
+    init(cue: Cue, output: AudioOutput?, video: VideoOutput,
+         streamResolver: ((Cue) async throws -> StreamPlan)? = nil, preparedPlayer: AVPlayer? = nil) {
         self.cue = cue
         self.output = output
         self.video = video
-        let s = min(max(cue.speed, 0.25), 4)
+        self.streamResolver = streamResolver
+        self.preparedPlayer = preparedPlayer
+        // Streams play at normal speed (no time stretching for them yet).
+        let s = cue.isStream ? 1 : min(max(cue.speed, 0.25), 4)
         self.speed = s
         self.targetSpeed = s
     }
@@ -99,6 +111,10 @@ final class PlaybackSession: Identifiable {
     /// Loads everything so that start(at:) is instant. Playback begins at
     /// media time `position`.
     func prepare(fromMedia position: Double = 0) async throws {
+        if cue.isStream {
+            try await prepareStream(fromMedia: position)
+            return
+        }
         let timeline = try await CueTimeline.build(for: cue, audioSpeed: speed, includeVideo: cue.playsVideo)
         if isCancelled { return }
         mediaDuration = timeline.mediaDuration
@@ -120,53 +136,103 @@ final class PlaybackSession: Identifiable {
 
         // Video: muted AVPlayer slaved to the audio device clock.
         if let videoAsset = timeline.videoAsset {
-            let item = AVPlayerItem(asset: videoAsset)
-            let p = AVPlayer(playerItem: item)
-            p.automaticallyWaitsToMinimizeStalling = false
-            p.actionAtItemEnd = .pause
-            p.isMuted = true
-            if let clock = output?.clock { p.sourceClock = clock }
-            player = p
-
-            let deadline = Date().addingTimeInterval(20)
-            while item.status == .unknown && Date() < deadline && !isCancelled {
-                try await Task.sleep(nanoseconds: 10_000_000)
-            }
-            if isCancelled { return }
-            if item.status == .failed {
-                throw item.error ?? MediaError.build("The video of \(cue.name) could not be loaded.")
-            }
-            if begin > 0 {
-                _ = await p.seek(to: cmTime(begin), toleranceBefore: .zero, toleranceAfter: .zero)
-            }
-            if item.status == .readyToPlay {
-                _ = await p.preroll(atRate: Float(speed))
-            }
-            endObserver = NotificationCenter.default.addObserver(
-                forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
-                guard let session = self else { return }
-                Task { @MainActor in session.videoEnded = true }
-            }
-            // The layer goes on the output (invisible) now, so its first frame
-            // is ready the moment playback starts. This opens the output window
-            // a fraction of a second before the cue starts.
-            let layer = AVPlayerLayer(player: p)
-            layer.videoGravity = .resizeAspect
-            layer.opacity = 0
-            playerLayer = layer
-            video.attach(layer)
-            layerAttached = true
+            try await attachPlayer(AVPlayerItem(asset: videoAsset), begin: begin)
         }
     }
 
-    /// Creates a mixer voice for an audio timeline stretched to `speed`,
-    /// positioned at media time `media`, and starts decoding there.
-    private func makeVoice(asset: AVComposition,
-                           tracks: [(track: AVCompositionTrack, channels: Int, layout: Data?)],
-                           atMedia media: Double, speed s: Double,
-                           prefillSeconds: Double, ramp: Double) async throws -> (voice: Int32, decoder: AudioDecoder) {
+    /// BCC Media: audio from the stream's language renditions (decoded by
+    /// CueDeck into the mixer), video from the stream itself.
+    private func prepareStream(fromMedia position: Double) async throws {
+        guard let resolve = streamResolver else { throw MediaError.build("\(cue.name) can't be streamed.") }
+        let plan = try await resolve(cue)
+        if isCancelled { return }
+        streamPlan = plan
+        playerOffset = cue.segmentStart
+        mediaDuration = cue.segmentDuration
+        let begin = clampMedia(position)
+        pausedMedia = begin
+        anchorMedia = begin
+
+        if output != nil, !plan.audio.isEmpty {
+            let made = try await makeStreamVoice(atMedia: begin, prefillSeconds: 1.0, ramp: 0)
+            voice = made.voice
+            decoder = made.decoder
+            voiceSpeed = 1
+            if isCancelled { return }
+        }
+        if cue.playsVideo {
+            let prepared = preparedPlayer
+            preparedPlayer = nil
+            let item = prepared?.currentItem ?? AVPlayerItem(url: plan.masterURL)
+            item.preferredForwardBufferDuration = 15
+            if cue.outPoint > 0 { item.forwardPlaybackEndTime = cmTime(cue.segmentEnd) }
+            try await attachPlayer(item, begin: begin, player: prepared)
+        }
+    }
+
+    /// Muted AVPlayer for `item` on the audio device clock, at media time
+    /// `begin`, with its layer (still invisible) on the output.
+    private func attachPlayer(_ item: AVPlayerItem, begin: Double, player existing: AVPlayer? = nil) async throws {
+        let p = existing ?? AVPlayer(playerItem: item)
+        p.automaticallyWaitsToMinimizeStalling = false
+        p.actionAtItemEnd = .pause
+        p.isMuted = true
+        if let clock = output?.clock { p.sourceClock = clock }
+        player = p
+
+        let deadline = Date().addingTimeInterval(20)
+        while item.status == .unknown && Date() < deadline && !isCancelled {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        if isCancelled { return }
+        if item.status == .failed {
+            throw item.error ?? MediaError.build("The video of \(cue.name) could not be loaded.")
+        }
+        // A prepared player is usually at the right place already.
+        if begin + playerOffset > 0, abs(p.currentTime().seconds - (begin + playerOffset)) > 0.02 || existing == nil {
+            _ = await p.seek(to: playerTime(begin), toleranceBefore: .zero, toleranceAfter: .zero)
+        }
+        if item.status == .readyToPlay {
+            _ = await p.preroll(atRate: Float(speed))
+        }
+        endObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
+            guard let session = self else { return }
+            Task { @MainActor in session.videoEnded = true }
+        }
+        // The layer goes on the output (invisible) now, so its first frame
+        // is ready the moment playback starts. This opens the output window
+        // a fraction of a second before the cue starts.
+        let layer = AVPlayerLayer(player: p)
+        layer.videoGravity = .resizeAspect
+        layer.opacity = 0
+        playerLayer = layer
+        video.attach(layer)
+        layerAttached = true
+    }
+
+    /// A mixer voice for a BCC Media stream at media time `media` (normal speed).
+    private func makeStreamVoice(atMedia media: Double, prefillSeconds: Double,
+                                 ramp: Double) async throws -> (voice: Int32, decoder: VoiceFeeder) {
+        guard let out = output, let plan = streamPlan else { throw MediaError.build("No audio output.") }
+        let channels = cue.audioTracks.map(\.channels)
+        let v = try createVoice(channelCounts: channels.map { UInt32($0) }, atMedia: media, speed: 1, ramp: ramp)
+        let dec = StreamAudioDecoder(playlists: plan.audio, channels: channels,
+                                     start: cue.segmentStart + media, end: cue.segmentEnd,
+                                     sampleRate: out.sampleRate, mixer: out.mixer, voice: v)
+        dec.start()
+        _ = await dec.waitForPrefill(seconds: prefillSeconds, sampleRate: out.sampleRate, timeout: 15)
+        if let failure = dec.failure {
+            AudioCleanup.release(voice: v, decoder: dec, output: out)
+            throw MediaError.build("\(cue.name): \(failure)")
+        }
+        return (v, dec)
+    }
+
+    /// A new mixer voice with routes, gain and envelope, positioned at media time `media`.
+    private func createVoice(channelCounts: [UInt32], atMedia media: Double, speed s: Double,
+                             ramp: Double) throws -> Int32 {
         guard let out = output else { throw MediaError.build("No audio output.") }
-        let channelCounts = tracks.map { UInt32($0.channels) }
         let ringFrames = UInt32(out.sampleRate * 4)
         let v = channelCounts.withUnsafeBufferPointer { buf -> Int32 in
             guard let base = buf.baseAddress else { return -1 }
@@ -176,19 +242,31 @@ final class PlaybackSession: Identifiable {
             throw MediaError.build("Too many cues are playing at the same time.")
         }
         let rate = out.sampleRate
-        applyRoutes(to: v, trackCount: tracks.count)
+        applyRoutes(to: v, trackCount: channelCounts.count)
         cm_voice_set_gain(out.mixer, v, cue.linearGain)
         let fadeOut = cue.endAction == .loop ? 0 : cue.fadeOut
         cm_voice_set_envelope(out.mixer, v, Int64(mediaDuration / s * rate),
                               Int64(cue.fadeIn * rate), Int64(fadeOut * rate))
-        let outputStart = media / s
-        cm_voice_set_position(out.mixer, v, Int64(outputStart * rate))
+        cm_voice_set_position(out.mixer, v, Int64(media / s * rate))
         if ramp > 0 { cm_voice_set_start_ramp(out.mixer, v, Int64(ramp * rate)) }
+        return v
+    }
+
+    /// Creates a mixer voice for an audio timeline stretched to `speed`,
+    /// positioned at media time `media`, and starts decoding there.
+    private func makeVoice(asset: AVComposition,
+                           tracks: [(track: AVCompositionTrack, channels: Int, layout: Data?)],
+                           atMedia media: Double, speed s: Double,
+                           prefillSeconds: Double, ramp: Double) async throws -> (voice: Int32, decoder: VoiceFeeder) {
+        guard let out = output else { throw MediaError.build("No audio output.") }
+        let v = try createVoice(channelCounts: tracks.map { UInt32($0.channels) }, atMedia: media, speed: s, ramp: ramp)
+        let rate = out.sampleRate
+        let outputStart = media / s
         do {
             let dec = try AudioDecoder(asset: asset, tracks: tracks, sampleRate: rate,
                                        mixer: out.mixer, voice: v, startTime: outputStart)
             dec.start()
-            _ = await dec.waitForPrefill(seconds: prefillSeconds, sampleRate: rate)
+            _ = await dec.waitForPrefill(seconds: prefillSeconds, sampleRate: rate, timeout: 8)
             return (v, dec)
         } catch {
             AudioCleanup.release(voice: v, decoder: nil, output: out)
@@ -200,6 +278,9 @@ final class PlaybackSession: Identifiable {
         CMTime(seconds: seconds, preferredTimescale: 48000)
     }
 
+    /// The player's time for media time `m` (streams play in file time).
+    private func playerTime(_ m: Double) -> CMTime { cmTime(m + playerOffset) }
+
     // MARK: - Transport
 
     /// Starts audio and video exactly at `host` (mach_absolute_time ticks).
@@ -208,7 +289,7 @@ final class PlaybackSession: Identifiable {
         firstStartHost = host
         setAnchor(host: host, media: pausedMedia, previousSpeed: 0)
         if voice >= 0, let out = output { cm_voice_start(out.mixer, voice, host) }
-        player?.setRate(Float(speed), time: cmTime(pausedMedia), atHostTime: HostClock.cmTime(host))
+        player?.setRate(Float(speed), time: playerTime(pausedMedia), atHostTime: HostClock.cmTime(host))
         // Fade the picture in from the exact start time (instantly without a fade in).
         let fadeIn = pausedMedia <= 0 ? cue.fadeIn : 0
         animateOpacity(to: 1, over: fadeIn, from: 0, beginAt: Double(host) / HostClock.ticksPerSecond)
@@ -237,7 +318,7 @@ final class PlaybackSession: Identifiable {
             position = Double(cm_voice_position(out.mixer, voice)) / out.sampleRate * voiceSpeed
             cm_voice_start(out.mixer, voice, host)
         }
-        player?.setRate(Float(speed), time: cmTime(position), atHostTime: HostClock.cmTime(host))
+        player?.setRate(Float(speed), time: playerTime(position), atHostTime: HostClock.cmTime(host))
         setAnchor(host: host, media: position, previousSpeed: 0)
         state = .playing
         startSpeedTaskIfNeeded()
@@ -343,7 +424,7 @@ final class PlaybackSession: Identifiable {
         let m = clampMedia(target)
         pausedMedia = m
         let tol = CMTime(seconds: 0.1, preferredTimescale: 600)
-        player?.seek(to: cmTime(m), toleranceBefore: tol, toleranceAfter: tol)
+        player?.seek(to: playerTime(m), toleranceBefore: tol, toleranceAfter: tol)
     }
 
     /// Jumps to media time `target`. Keeps playing if the cue was playing (or
@@ -363,7 +444,23 @@ final class PlaybackSession: Identifiable {
 
         // Audio: replace the voice with one that starts at m.
         releaseRetiring()
-        if output != nil, let comp = audioAsset {
+        if output != nil, streamPlan != nil {
+            AudioCleanup.release(voice: voice, decoder: decoder, output: output)
+            voice = -1
+            decoder = nil
+            do {
+                let made = try await makeStreamVoice(atMedia: m, prefillSeconds: 0.5, ramp: 0.01)
+                if generation != seekGeneration || state == .finished {
+                    AudioCleanup.release(voice: made.voice, decoder: made.decoder, output: output)
+                    return
+                }
+                voice = made.voice
+                decoder = made.decoder
+            } catch {
+                if generation == seekGeneration { seeking = false }
+                return
+            }
+        } else if output != nil, let comp = audioAsset {
             AudioCleanup.release(voice: voice, decoder: decoder, output: output)
             voice = -1
             decoder = nil
@@ -383,7 +480,7 @@ final class PlaybackSession: Identifiable {
         }
 
         if let p = player {
-            _ = await p.seek(to: cmTime(m), toleranceBefore: .zero, toleranceAfter: .zero)
+            _ = await p.seek(to: playerTime(m), toleranceBefore: .zero, toleranceAfter: .zero)
             if generation != seekGeneration || state == .finished { return }
         }
         seeking = false
@@ -400,6 +497,7 @@ final class PlaybackSession: Identifiable {
     /// to a re-stretched stream at an exact host time; video changes rate at
     /// that same moment, so picture and sound stay locked.
     func setSpeed(_ newSpeed: Double) {
+        guard !cue.isStream else { return }
         targetSpeed = min(max(newSpeed, 0.25), 4)
         startSpeedTaskIfNeeded()
     }
@@ -455,7 +553,7 @@ final class PlaybackSession: Identifiable {
         // Start the new stream a little ahead, then switch exactly when the
         // current stream reaches that point.
         let switchMedia = clampMedia(mediaTime + 0.35 * s1)
-        let made: (voice: Int32, decoder: AudioDecoder)
+        let made: (voice: Int32, decoder: VoiceFeeder)
         do {
             made = try await makeVoice(asset: comp, tracks: tracks, atMedia: switchMedia,
                                        speed: s2, prefillSeconds: 0.25, ramp: 0.03)
@@ -519,6 +617,8 @@ final class PlaybackSession: Identifiable {
     func update(cue newCue: Cue) {
         guard newCue.id == cue.id else { return }
         let routesChanged = newCue.routes != cue.routes
+        // A stream whose languages changed needs new audio (another rendition).
+        let languagesChanged = cue.isStream && newCue.audioTracks.map(\.language) != cue.audioTracks.map(\.language)
         cue.volumeDB = newCue.volumeDB
         cue.routes = newCue.routes
         cue.stopFade = newCue.stopFade
@@ -527,10 +627,20 @@ final class PlaybackSession: Identifiable {
         cue.speed = newCue.speed
         if voice >= 0, let out = output {
             cm_voice_set_gain(out.mixer, voice, cue.linearGain)
-            if routesChanged { applyRoutes(to: voice, trackCount: audioTracks.count) }
+            if routesChanged && !languagesChanged { applyRoutes(to: voice, trackCount: voiceTrackCount) }
         }
-        if min(max(newCue.speed, 0.25), 4) != targetSpeed { setSpeed(newCue.speed) }
+        if languagesChanged, let resolve = streamResolver, state == .playing || state == .paused {
+            Task { [weak self] in
+                guard let self, let plan = try? await resolve(self.cue) else { return }
+                self.streamPlan = plan
+                await self.seek(toMedia: self.mediaTime)      // rebuilds the voice with the new languages
+            }
+        }
+        if !cue.isStream && min(max(newCue.speed, 0.25), 4) != targetSpeed { setSpeed(newCue.speed) }
     }
+
+    /// Tracks of the current voice.
+    private var voiceTrackCount: Int { streamPlan?.audio.count ?? audioTracks.count }
 
     private func applyRoutes(to v: Int32, trackCount: Int) {
         guard v >= 0, let out = output else { return }
@@ -562,7 +672,7 @@ final class PlaybackSession: Identifiable {
         if voice >= 0, let out = output {
             return Double(cm_voice_position(out.mixer, voice)) / out.sampleRate * voiceSpeed
         }
-        if let p = player { return max(0, p.currentTime().seconds) }
+        if let p = player { return max(0, p.currentTime().seconds - playerOffset) }
         return anchorMedia + Double(now - anchorHost) / HostClock.ticksPerSecond * speed
     }
 
@@ -580,7 +690,7 @@ final class PlaybackSession: Identifiable {
     /// audio position for cues without video). Used for exact frame steps.
     var displayedFileTime: Double {
         if let p = player, state != .preparing, !seeking {
-            let t = p.currentTime().seconds
+            let t = p.currentTime().seconds - playerOffset
             if t.isFinite { return cue.fileTime(forMedia: max(0, t)) }
         }
         return fileTime

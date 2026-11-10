@@ -42,7 +42,13 @@ final class PlaybackEngine: NSObject, ObservableObject {
     private let undoGrouping: TimeInterval = 0.8
     private let undoLimit = 100
     /// The cue GO plays next and the inspector shows.
-    @Published var selection: UUID? { didSet { syncSetFromSelection() } }
+    @Published var selection: UUID? {
+        didSet {
+            syncSetFromSelection()
+            // Load a BCC Media cue ahead, so GO starts it at once.
+            if let id = selection, let cue = findCue(id), cue.isStream { preloadStream(cue) } else { discardPreload() }
+        }
+    }
     /// All selected cues in the list (Shift-click for a range, ⌘-click to add).
     @Published var selectedIDs: Set<UUID> = [] { didSet { syncSelectionFromSet() } }
     private var syncingSelection = false
@@ -107,6 +113,12 @@ final class PlaybackEngine: NSObject, ObservableObject {
     let bcc = BCCMediaAccount()
     /// Shows the "Add BCC Media Link" sheet.
     @Published var showBCCSheet = false
+    /// Stream links of BCC Media episodes, by episode id, until they expire.
+    private var streamMasters: [String: (url: URL, master: HLSMaster, expires: Date)] = [:]
+    /// The next BCC Media cue, loaded ahead: its first audio segments are in
+    /// StreamCache and its video player is buffered at the start position.
+    private var preload: (cueID: UUID, fileTime: Double, player: AVPlayer?)?
+    private var preloadTask: Task<Void, Never>?
     /// Draw subtitles over the video output (for setups without CasparCG).
     @Published var subtitlesOnVideo: Bool = UserDefaults.standard.bool(forKey: "subtitlesOnVideo") {
         didSet { UserDefaults.standard.set(subtitlesOnVideo, forKey: "subtitlesOnVideo") }
@@ -372,7 +384,83 @@ final class PlaybackEngine: NSObject, ObservableObject {
         }
         cue.normalizeRoutes(outputChannels: routingChannels, defaults: defaultRouting)
         if let index { cues.insert(cue, at: min(max(index, 0), cues.count)) } else { cues.append(cue) }
-        selection = cue.id
+        selection = cue.id          // also loads it ahead
+    }
+
+    /// Loads the start of a BCC Media cue ahead: audio of its languages into
+    /// StreamCache, and a video player buffered at the start (not on screen).
+    func preloadStream(_ cue: Cue) {
+        let fileTime = pendingStarts[cue.id] ?? cue.segmentStart
+        if let p = preload, p.cueID == cue.id, abs(p.fileTime - fileTime) < 0.05 { return }
+        discardPreload()
+        preload = (cue.id, fileTime, nil)
+        preloadTask = Task { [weak self] in
+            guard let self, let plan = try? await self.streamPlan(for: cue), !Task.isCancelled else { return }
+            await withTaskGroup(of: Void.self) { group in
+                for url in plan.audio {
+                    group.addTask { await StreamAudioTrack.prefetch(playlistURL: url, start: fileTime) }
+                }
+            }
+            guard cue.playsVideo, !Task.isCancelled, self.preload?.cueID == cue.id else { return }
+            let item = AVPlayerItem(url: plan.masterURL)
+            item.preferredForwardBufferDuration = 6
+            let player = AVPlayer(playerItem: item)
+            player.automaticallyWaitsToMinimizeStalling = false
+            player.isMuted = true
+            let deadline = Date().addingTimeInterval(20)
+            while item.status == .unknown && Date() < deadline && !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 20_000_000)
+            }
+            guard item.status == .readyToPlay, !Task.isCancelled, self.preload?.cueID == cue.id else { return }
+            _ = await player.seek(to: CMTime(seconds: fileTime, preferredTimescale: 48000),
+                                  toleranceBefore: .zero, toleranceAfter: .zero)
+            _ = await player.preroll(atRate: 1)
+            if !Task.isCancelled, self.preload?.cueID == cue.id {
+                self.preload = (cue.id, fileTime, player)
+            }
+        }
+    }
+
+    private func discardPreload() {
+        preloadTask?.cancel()
+        preloadTask = nil
+        if let p = preload?.player {
+            p.cancelPendingPrerolls()
+            p.replaceCurrentItem(with: nil)
+        }
+        preload = nil
+    }
+
+    /// The buffered player for `cue` starting at `fileTime`, if it was loaded ahead.
+    private func takePreparedPlayer(for cue: Cue, fileTime: Double) -> AVPlayer? {
+        guard let p = preload, p.cueID == cue.id, abs(p.fileTime - fileTime) < 0.05, let player = p.player else { return nil }
+        preload = nil
+        preloadTask = nil
+        return player
+    }
+
+    /// The current stream links for a BCC Media cue: the master playlist and
+    /// one audio playlist per cue stream (matched by language).
+    func streamPlan(for cue: Cue) async throws -> StreamPlan {
+        guard let id = cue.bccEpisodeID else { throw StreamError("\(cue.name) is not a BCC Media cue.") }
+        var entry = streamMasters[id]
+        if entry == nil || entry!.expires < Date().addingTimeInterval(600) {
+            guard bcc.isSignedIn else {
+                throw StreamError("Sign in to BCC Media to play \(cue.name) (File › Add BCC Media Link…).")
+            }
+            let token = try await bcc.accessToken()
+            let episode = try await BCCMedia.episode(id: id, token: token)
+            let master = try await HLSMaster.load(episode.streamURL)
+            entry = (episode.streamURL, master, episode.expiresAt ?? Date().addingTimeInterval(3600))
+            streamMasters[id] = entry
+        }
+        guard let entry else { throw StreamError("No stream for \(cue.name).") }
+        let audio = try cue.audioTracks.map { t -> URL in
+            if let r = entry.master.audio.first(where: { $0.language == t.language && !t.language.isEmpty }) { return r.url }
+            if t.language.isEmpty, t.index < entry.master.audio.count { return entry.master.audio[t.index].url }
+            throw StreamError("\(cue.name): the language \(t.fileName) is no longer offered.")
+        }
+        return StreamPlan(masterURL: entry.url, audio: audio, subtitles: entry.master.subtitles)
     }
 
     private static func streamSlot(_ index: Int, _ l: StreamLanguage) -> AudioTrackInfo {
@@ -648,11 +736,7 @@ final class PlaybackEngine: NSObject, ObservableObject {
     private func start(_ group: [Cue], at hostTime: UInt64?, stopOthers: Bool) {
         var ready: [(session: PlaybackSession, media: Double)] = []
         for cue in group {
-            if cue.isStream {
-                message = "\(cue.name): playing BCC Media cues comes in the next update."
-                continue
-            }
-            if cue.missing || !FileManager.default.fileExists(atPath: cue.url.path) {
+            if !cue.isStream && (cue.missing || !FileManager.default.fileExists(atPath: cue.url.path)) {
                 message = "File not found: \(cue.url.path)"
                 continue
             }
@@ -661,7 +745,15 @@ final class PlaybackEngine: NSObject, ObservableObject {
             }
             let startMedia = pendingStarts[cue.id].map { cue.mediaTime(forFile: min(cue.seekTarget($0), cue.segmentEnd)) } ?? 0
             pendingStarts[cue.id] = nil
-            ready.append((PlaybackSession(cue: cue, output: output, video: video), startMedia))
+            let resolver: ((Cue) async throws -> StreamPlan)? = cue.isStream
+                ? { [weak self] c in
+                    guard let self else { throw StreamError("CueDeck is closing.") }
+                    return try await self.streamPlan(for: c)
+                }
+                : nil
+            let prepared = cue.isStream ? takePreparedPlayer(for: cue, fileTime: cue.segmentStart + startMedia) : nil
+            ready.append((PlaybackSession(cue: cue, output: output, video: video,
+                                          streamResolver: resolver, preparedPlayer: prepared), startMedia))
         }
         guard !ready.isEmpty else { return }
         let previous = sessions.filter { $0.isActive }
@@ -747,6 +839,7 @@ final class PlaybackEngine: NSObject, ObservableObject {
             Task { await s.seek(toMedia: m) }
         } else if let cue = findCue(id) {
             pendingStarts[id] = min(max(seconds, cue.segmentStart), cue.segmentEnd)
+            if cue.isStream && selection == id { preloadStream(cue) }     // load ahead from the new start
         }
     }
 

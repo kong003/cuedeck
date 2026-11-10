@@ -4,11 +4,20 @@ import CoreMedia
 import Foundation
 import ObjCSupport
 
+/// Something that fills the tracks of a mixer voice: AudioDecoder (files) or
+/// StreamAudioDecoder (BCC Media streams).
+protocol VoiceFeeder: AnyObject {
+    func start()
+    /// Stops feeding; afterwards the feeder never touches the mixer again.
+    func cancelAndWait()
+    func waitForPrefill(seconds: Double, sampleRate: Double, timeout: Double) async -> Bool
+}
+
 /// Decodes every audio track of a cue on a background thread and feeds the
 /// mixer's ring buffers. Each track gets its own AVAssetReader so tracks never
 /// block each other. The reader also resamples to the device rate and applies
 /// pitch-preserving time stretching for speed changes.
-final class AudioDecoder: @unchecked Sendable {
+final class AudioDecoder: VoiceFeeder, @unchecked Sendable {
     private let mixer: OpaquePointer
     private let voice: Int32
     private var readers: [AVAssetReader] = []
