@@ -662,6 +662,10 @@ struct CueRow: View {
                         .disabled(engine.showMode)
                         .help("Play only the audio of this file, without video output. Applies the next time the cue starts.")
                     }
+                    if !cue.subtitleTracks.isEmpty {
+                        SubtitleMenu(cue: cue)
+                            .disabled(engine.showMode)
+                    }
                     AutoStartMenu(cue: cue, isFirst: number == 1)
                         .disabled(engine.showMode)
                 }
@@ -685,6 +689,41 @@ struct CueRow: View {
                 .padding(.horizontal, -6)
             }
         }
+    }
+}
+
+/// Dropdown in the cue list: which subtitle language this cue shows (or none).
+struct SubtitleMenu: View {
+    @EnvironmentObject var engine: PlaybackEngine
+    let cue: Cue
+
+    private func choose(_ i: Int) {
+        guard var c = engine.findCue(cue.id) else { return }
+        c.subtitleChoice = i
+        engine.updateCue(c)
+    }
+
+    var body: some View {
+        let selected = cue.selectedSubtitles
+        Menu {
+            Button { choose(-1) } label: {
+                if selected == nil { Label("Off", systemImage: "checkmark") } else { Text("Off") }
+            }
+            ForEach(Array(cue.subtitleTracks.enumerated()), id: \.offset) { i, t in
+                Button { choose(i) } label: {
+                    if selected?.index == t.index { Label(t.displayName, systemImage: "checkmark") } else { Text(t.displayName) }
+                }
+            }
+        } label: {
+            Label(selected?.displayName ?? "No subtitles", systemImage: "captions.bubble")
+                .lineLimit(1)
+        }
+        .menuStyle(.button)
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .tint(selected == nil ? nil : Color.accentColor)
+        .fixedSize()
+        .help("Subtitles shown while this cue plays (Settings › Subtitles sets where)")
     }
 }
 

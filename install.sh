@@ -1,8 +1,8 @@
 #!/bin/sh
 # Installs or updates CueDeck in /Applications (or ~/Applications) and allows it to run.
 #
-#   sh "/Volumes/CueDeck 0.7.1/install.sh"     (from the opened DMG)
-#   sh install.sh ~/Downloads/CueDeck-0.7.1.dmg
+#   sh "/Volumes/CueDeck 0.8.0/install.sh"     (from the opened DMG)
+#   sh install.sh ~/Downloads/CueDeck-0.8.0.dmg
 #   sh install.sh                              (newest CueDeck-*.dmg in Downloads)
 #
 # CueDeck has no Developer ID signature, so macOS blocks a copied app until

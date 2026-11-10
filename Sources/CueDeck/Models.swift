@@ -175,6 +175,8 @@ struct Cue: Identifiable, Codable, Equatable {
     var frameRate: Double = 0          // video frames per second, 0 = unknown / no video
     var audioTracks: [AudioTrackInfo] = []
     var subtitleTracks: [SubtitleTrackInfo] = []
+    /// Index into `subtitleTracks` of the subtitles to show, -1 = none.
+    var subtitleChoice: Int = 0
     /// Set for a BCC Media episode played from the internet instead of a file
     /// (`url` is then the episode's web link).
     var bccEpisodeID: String?
@@ -192,8 +194,11 @@ struct Cue: Identifiable, Codable, Equatable {
         self.name = url.deletingPathExtension().lastPathComponent
     }
 
-    /// The subtitle track sent to CasparCG: the file's first one.
-    var selectedSubtitles: SubtitleTrackInfo? { subtitleTracks.first }
+    /// The subtitle track shown for this cue (the first one unless chosen otherwise).
+    var selectedSubtitles: SubtitleTrackInfo? {
+        guard subtitleChoice >= 0, !subtitleTracks.isEmpty else { return nil }
+        return subtitleTracks[min(subtitleChoice, subtitleTracks.count - 1)]
+    }
 
     /// Whether playing this cue shows video.
     var playsVideo: Bool { hasVideo && !audioOnly }
@@ -313,7 +318,7 @@ struct Cue: Identifiable, Codable, Equatable {
     enum CodingKeys: String, CodingKey {
         case id, url, name, speed, volumeDB, fadeIn, fadeOut, stopFade, inPoint, outPoint,
              endAction, autoStart, audioOnly, playAlongside, routes, duration, hasVideo, videoSize, frameRate, audioTracks,
-             subtitleTracks, bccEpisodeID, streamLanguages
+             subtitleTracks, subtitleChoice, bccEpisodeID, streamLanguages
     }
 
     init(from decoder: Decoder) throws {
@@ -339,6 +344,7 @@ struct Cue: Identifiable, Codable, Equatable {
         frameRate = try c.decodeIfPresent(Double.self, forKey: .frameRate) ?? 0
         audioTracks = try c.decodeIfPresent([AudioTrackInfo].self, forKey: .audioTracks) ?? []
         subtitleTracks = try c.decodeIfPresent([SubtitleTrackInfo].self, forKey: .subtitleTracks) ?? []
+        subtitleChoice = try c.decodeIfPresent(Int.self, forKey: .subtitleChoice) ?? 0
         bccEpisodeID = try c.decodeIfPresent(String.self, forKey: .bccEpisodeID)
         streamLanguages = try c.decodeIfPresent([StreamLanguage].self, forKey: .streamLanguages) ?? []
     }
@@ -366,6 +372,7 @@ struct Cue: Identifiable, Codable, Equatable {
         try c.encode(frameRate, forKey: .frameRate)
         try c.encode(audioTracks, forKey: .audioTracks)
         try c.encode(subtitleTracks, forKey: .subtitleTracks)
+        if subtitleChoice != 0 { try c.encode(subtitleChoice, forKey: .subtitleChoice) }
         try c.encodeIfPresent(bccEpisodeID, forKey: .bccEpisodeID)
         if !streamLanguages.isEmpty { try c.encode(streamLanguages, forKey: .streamLanguages) }
     }
