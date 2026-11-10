@@ -31,7 +31,7 @@ newer) and packs it into `build/CueDeck-<version>.dmg`.
    the DMG window into Terminal after typing `sh `):
 
    ```sh
-   sh "/Volumes/CueDeck 0.4.1/install.sh"
+   sh "/Volumes/CueDeck 0.6.0/install.sh"
    ```
 
    It quits CueDeck, replaces the app in Applications, removes the
